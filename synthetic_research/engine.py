@@ -3,6 +3,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 
+from synthetic_research.corpus import corpus_hash, find_pii, validate_campaign
 from synthetic_research.gates import (
     ResearchError,
     assert_brand_allowed,
@@ -13,7 +14,8 @@ from synthetic_research.gates import (
     public_evidence,
     quote_is_verbatim,
 )
-from synthetic_research.retrieve import SOURCE_KINDS, build_index, retrieve
+from synthetic_research.retrieve import SOURCE_KINDS
+from synthetic_research.search import retrieve_evidence
 
 TURN_CAP = 10
 
@@ -23,11 +25,13 @@ def _now() -> str:
 
 
 class ResearchEngine:
-    def __init__(self, store, llm):
+    def __init__(self, store, llm, embedder=None):
         self.store = store
         self.llm = llm
+        self.embedder = embedder
 
     def open(self, campaign: dict, actor: str) -> dict:
+        validate_campaign(campaign)
         if not campaign.get("kit", {}).get("locked"):
             raise ResearchError("KIT_UNLOCKED", "The brand kit must be locked before a session can open.")
         session = {
@@ -55,24 +59,43 @@ class ResearchEngine:
             "skips": [],
             "pack": None,
             "packNotes": [],
+            "corpusHash": corpus_hash(campaign),
         }
-        return self.store.create(session)
+        created = self.store.create(session)
+        self._audit(created["sessionId"], "SESSION_OPENED", actor=actor, corpusHash=created["corpusHash"])
+        return created
 
     def grant(self, session_id: str, grant_id: str, steward: str) -> dict:
         session = self._open_session(session_id)
         documents = [doc for doc in session["documents"] if doc["kind"] in SOURCE_KINDS]
         if not documents:
             raise ResearchError("GOLD_EMPTY", "The gold slice has no transcript, review, or screener rows.")
+        pii = find_pii(documents)
+        if pii:
+            raise ResearchError("PII_REJECTED", f"Gold documents contain contact data: {', '.join(pii)}.")
+        indexed, retrieval, warning = self._index_documents(documents)
         session["grant"] = {
             "grantId": grant_id,
             "steward": steward,
             "status": "active",
             "documentCount": len(documents),
             "grantedAt": _now(),
+            "retrieval": retrieval,
+            "corpusHash": session["corpusHash"],
+            "embeddingWarning": warning,
         }
         session["insightLocked"] = False
         session["guide"] = _fresh_guide(session["guideTemplate"])
-        self.store.write_index(session_id, {"grantId": grant_id, "documents": documents})
+        self.store.write_index(session_id, {"grantId": grant_id, "retrieval": retrieval, "documents": indexed})
+        self._audit(
+            session_id,
+            "GRANT_ACTIVATED",
+            steward=steward,
+            grantId=grant_id,
+            documents=len(documents),
+            retrieval=retrieval,
+            corpusHash=session["corpusHash"],
+        )
         return self.store.write(session)
 
     def refuse(self, session_id: str, steward: str, reason: str) -> dict:
@@ -86,6 +109,7 @@ class ResearchEngine:
         }
         session["insightLocked"] = True
         self.store.drop_index(session_id)
+        self._audit(session_id, "GRANT_REFUSED", steward=steward)
         return self.store.write(session)
 
     def revoke(self, session_id: str, steward: str) -> dict:
@@ -97,6 +121,7 @@ class ResearchEngine:
         session["grant"]["revokedAt"] = _now()
         session["insightLocked"] = True
         self.store.drop_index(session_id)
+        self._audit(session_id, "GRANT_REVOKED", steward=steward)
         return self.store.write(session)
 
     def list_cohorts(self, session_id: str) -> list[dict]:
@@ -416,11 +441,15 @@ class ResearchEngine:
         if not session["grant"] or session["grant"]["status"] != "active":
             raise ResearchError("GRANT_MISSING", "Refresh needs an active grant.")
         documents = [doc for doc in session["documents"] if doc["kind"] in SOURCE_KINDS]
+        indexed, retrieval, warning = self._index_documents(documents)
+        session["grant"]["retrieval"] = retrieval
+        session["grant"]["embeddingWarning"] = warning
         self.store.write_index(
             session_id,
             {
                 "grantId": session["grant"]["grantId"],
-                "documents": documents,
+                "retrieval": retrieval,
+                "documents": indexed,
                 "refreshedBy": steward,
                 "refreshedAt": _now(),
             },
@@ -435,6 +464,7 @@ class ResearchEngine:
         refreshed["insightLocked"] = False
         if refreshed["pack"] and refreshed["pack"]["status"] != "approved":
             refreshed["pack"]["status"] = "stale"
+        self._audit(session_id, "GRANT_REFRESHED", steward=steward, retrieval=retrieval)
         return self.store.write(refreshed)
 
     def approve(self, session_id: str, oversight_name: str) -> dict:
@@ -475,6 +505,7 @@ class ResearchEngine:
         }
         self.store.promote_pack(session_id, vault_pack)
         self.store.write(session)
+        self._audit(session_id, "PACK_APPROVED", oversight=name, corpusHash=session["corpusHash"])
         return vault_pack
 
     def close(self, session_id: str) -> dict:
@@ -483,6 +514,7 @@ class ResearchEngine:
         session["closedAt"] = _now()
         session["insightLocked"] = True
         self.store.drop_index(session_id)
+        self._audit(session_id, "SESSION_CLOSED")
         return self.store.write(session)
 
     def snapshot(self, session_id: str) -> dict:
@@ -490,6 +522,7 @@ class ResearchEngine:
             "session": self.store.read(session_id),
             "indexPresent": self.store.index_exists(session_id),
             "vault": self.store.read_vault(session_id),
+            "audit": self.store.read_audit(session_id),
         }
 
     def _answer_turn(self, session: dict, interview: dict, *, question: str, instruction: str) -> dict:
@@ -498,27 +531,15 @@ class ResearchEngine:
         evidence = []
         if not outside:
             payload = self._index(session)
-            index = build_index(payload["documents"])
-            evidence = retrieve(index, question, cohort_id=interview["cohortId"], limit=4)
-            if len(evidence) < 2:
-                broadened = " ".join(
-                    [
-                        question,
-                        card["label"],
-                        card["tension"],
-                        " ".join(card["traits"]),
-                        " ".join(card["affinity"]),
-                    ]
-                )
-                extra = retrieve(index, broadened, cohort_id=interview["cohortId"], limit=4)
-                seen = {item["id"] for item in evidence}
-                for item in extra:
-                    if item["id"] in seen:
-                        continue
-                    evidence.append(item)
-                    seen.add(item["id"])
-                    if len(evidence) == 4:
-                        break
+            query_vector = None
+            if self.embedder and any(document.get("vector") for document in payload["documents"]):
+                query_vector = self.embedder.embed([question])[0]
+            evidence = retrieve_evidence(
+                payload["documents"],
+                question,
+                cohort_id=interview["cohortId"],
+                query_vector=query_vector,
+            )
         if not evidence:
             return {
                 "id": str(uuid.uuid4()),
@@ -553,10 +574,16 @@ class ResearchEngine:
         evidence_ids = [item for item in raw.get("evidenceIds") or [] if item in allowed]
         reply = str(raw.get("reply") or "").strip()
         leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
-        abstain = bool(raw.get("abstain")) or not evidence_ids or not reply or leaked
+        pii = find_pii([{"id": "reply", "title": "", "text": reply}])
+        abstain = bool(raw.get("abstain")) or not evidence_ids or not reply or leaked or bool(pii)
         reason = None
         if abstain:
-            reason = "brand_locked" if leaked else "uncited"
+            if leaked:
+                reason = "brand_locked"
+            elif pii:
+                reason = "pii"
+            else:
+                reason = "uncited"
         return {
             "id": str(uuid.uuid4()),
             "phase": interview["phase"],
@@ -587,6 +614,29 @@ class ResearchEngine:
         if not payload:
             raise ResearchError("INDEX_MISSING", "This session has no index.")
         return payload
+
+    def _audit(self, session_id: str, action: str, **fields) -> None:
+        self.store.append_audit(session_id, {"at": _now(), "action": action, **fields})
+
+    def _index_documents(self, documents: list[dict]) -> tuple[list[dict], str, str | None]:
+        vectors = None
+        warning = None
+        retrieval = "lexical"
+        if self.embedder is not None:
+            try:
+                vectors = self.embedder.embed(
+                    [f"{document.get('title', '')}\n{document.get('text', '')}" for document in documents]
+                )
+                retrieval = "hybrid"
+            except Exception as error:
+                warning = str(error)[:180]
+        indexed = []
+        for index, document in enumerate(documents):
+            copy = {key: value for key, value in document.items() if key != "vector"}
+            if vectors is not None:
+                copy["vector"] = vectors[index]
+            indexed.append(copy)
+        return indexed, retrieval, warning
 
 
 def _fresh_guide(template: dict) -> dict:

@@ -70,6 +70,33 @@ class DeepInfraClient:
             max_tokens=1800,
         )
 
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        model = self._config.get("embed_model") or ""
+        if not model:
+            raise RuntimeError("DEEPINFRA_EMBED_MODEL is required for the session index.")
+        body = json.dumps({"model": model, "input": texts}).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self._config['base_url']}/embeddings",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self._config['api_key']}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[:400]
+            raise RuntimeError(f"DeepInfra embeddings {error.code}: {detail}") from None
+        rows = payload.get("data") or []
+        rows.sort(key=lambda row: row.get("index", 0))
+        vectors = [row.get("embedding") for row in rows]
+        if len(vectors) != len(texts) or any(not vector for vector in vectors):
+            raise RuntimeError("DeepInfra returned an incomplete embedding batch.")
+        return vectors
+
     def _chat(self, model: str, system: str, user: str, max_tokens: int) -> str:
         body = json.dumps(
             {

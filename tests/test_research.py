@@ -166,6 +166,59 @@ class ResearchTests(unittest.TestCase):
                 engine.list_cohorts(other["sessionId"])
             self.assertEqual(isolated.exception.code, "INSIGHT_LOCKED")
             self.assertFalse(engine.store.index_exists(other["sessionId"]))
+            actions = [event["action"] for event in engine.store.read_audit(session["sessionId"])]
+            self.assertIn("SESSION_OPENED", actions)
+            self.assertIn("GRANT_ACTIVATED", actions)
+            self.assertIn("PACK_APPROVED", actions)
+            self.assertIn("SESSION_CLOSED", actions)
+            self.assertTrue(engine.store.read(session["sessionId"])["corpusHash"])
+
+    def test_pack_rejects_contact_data_and_a_broken_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = ResearchEngine(SessionStore(Path(tmp)), FakeLlm())
+            broken = {**PACK, "campaignId": ""}
+            with self.assertRaises(ResearchError) as invalid:
+                engine.open(broken, actor="Meera")
+            self.assertEqual(invalid.exception.code, "PACK_INVALID")
+            session = engine.open(PACK, actor="Meera")
+            tainted = json.loads(json.dumps(PACK))
+            tainted["documents"][0]["text"] += " Contact maker@example.com for the recording."
+            engine.store.read(session["sessionId"])
+            stored = engine.store.read(session["sessionId"])
+            stored["documents"] = tainted["documents"]
+            engine.store.write(stored)
+            with self.assertRaises(ResearchError) as pii:
+                engine.grant(session["sessionId"], "gold-1842", steward="Arjun")
+            self.assertEqual(pii.exception.code, "PII_REJECTED")
+
+    def test_hybrid_search_ranks_meaning_when_the_words_do_not_overlap(self):
+        from synthetic_research.search import retrieve_evidence
+
+        documents = [
+            {
+                "id": "T-06",
+                "kind": "transcript",
+                "cohortIds": ["office-sippers"],
+                "title": "Delhi",
+                "text": "My flatmate is asleep and the morning drink is mine.",
+                "vector": [1.0, 0.0],
+            },
+            {
+                "id": "R-882",
+                "kind": "review",
+                "cohortIds": ["office-sippers"],
+                "title": "Medicinal",
+                "text": "Tastes like medicine and a protein shake.",
+                "vector": [0.0, 1.0],
+            },
+        ]
+        hits = retrieve_evidence(
+            documents,
+            "who else is in that moment with you",
+            cohort_id="office-sippers",
+            query_vector=[0.99, 0.01],
+        )
+        self.assertEqual(hits[0]["id"], "T-06")
 
 
 if __name__ == "__main__":

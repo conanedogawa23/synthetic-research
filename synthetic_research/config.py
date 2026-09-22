@@ -26,6 +26,7 @@ def read_config(root: Path) -> dict:
         "api_key": os.environ.get("DEEPINFRA_API_KEY", ""),
         "fast_model": fast_model,
         "reasoning_model": os.environ.get("DEEPINFRA_REASONING_MODEL", fast_model),
+        "embed_model": os.environ.get("DEEPINFRA_EMBED_MODEL", "google/embeddinggemma-300m"),
     }
 
 

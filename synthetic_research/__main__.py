@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def main() -> None:
     config = read_config(ROOT)
     assert_inference_config(config)
-    engine = ResearchEngine(SessionStore(ROOT / "data"), DeepInfraClient(config))
+    client = DeepInfraClient(config)
+    engine = ResearchEngine(SessionStore(ROOT / "data"), client, embedder=client)
     report_path = run_campaign(ROOT, ROOT / "gold" / "cam-1842.json", engine)
     sys.stdout.write(report_path.read_text(encoding="utf-8"))
     print(f"\nWrote {report_path}", file=sys.stderr)

@@ -19,6 +19,10 @@ def render_report(events: list[str], snapshot: dict, refreshed_error: str) -> st
         f"Session {session['sessionId']}",
         f"Kit {session['kit']['version']} locked. Brand alias {session['kit']['brandAlias']}.",
         f"Session status {session['status']}. Index present: {snapshot['indexPresent']}.",
+        f"Corpus {session.get('corpusHash', '')}.",
+        f"Retrieval {(session.get('grant') or {}).get('retrieval', 'none')}.",
+        _metric_line(session),
+        f"Audit events: {len(snapshot.get('audit') or [])}.",
         "",
         "Walk",
         *events,
@@ -46,6 +50,20 @@ def render_report(events: list[str], snapshot: dict, refreshed_error: str) -> st
     lines.append(f"After refresh, a new draft is blocked: {refreshed_error}")
     lines.append("The approved vault pack stays. Stale interviews stay out of a new draft.")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _metric_line(session: dict) -> str:
+    interviews = session.get("interviews") or []
+    turns = [turn for interview in interviews for turn in interview.get("turns") or []]
+    if not turns:
+        return "Interview turns: 0."
+    cited = sum(1 for turn in turns if not turn["abstain"] and turn["evidenceIds"])
+    abstained = sum(1 for turn in turns if turn["abstain"])
+    stale = sum(1 for interview in interviews if interview.get("stale"))
+    return (
+        f"Interview turns: {len(turns)}. Cited: {cited}. Abstained: {abstained}. "
+        f"Citation rate: {cited / len(turns):.0%}. Interviews marked stale after refresh: {stale}."
+    )
 
 
 def _phase(engine: ResearchEngine, session_id: str, cohort_id: str) -> str:
