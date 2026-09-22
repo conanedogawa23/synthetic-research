@@ -1,0 +1,211 @@
+{
+  "campaignId": "CAM-1842",
+  "grantId": "gold-1842",
+  "market": "IN",
+  "category": "coffee",
+  "window": "last 18 months",
+  "kit": {
+    "version": "v3",
+    "locked": true,
+    "brandAlias": "Aroha",
+    "purpose": "Pre-launch ready-to-drink coffee for India. The name is a session alias and is not a brand already on shelf."
+  },
+  "marketPack": {
+    "market": "IN",
+    "household": "Joint and nuclear households both appear. A can is often bought for one person and noticed by the rest of the house.",
+    "paymentRails": "UPI and cash. Kirana still matters beside Blinkit and Amazon.",
+    "taboos": [
+      "Do not mock filter coffee.",
+      "Do not call the drink a health or protein product.",
+      "Do not default to US latte language."
+    ]
+  },
+  "cohorts": [
+    {
+      "id": "office-sippers",
+      "cardId": "R1",
+      "label": "Office sipper",
+      "rule": "Office sippers 25–34 · metros · bought RTD coffee 90d",
+      "bounds": ["25–34", "metro India", "bought RTD coffee in 90 days", "not tea-only"],
+      "traits": ["desk drinker", "flavor-first", "low ritual"],
+      "tension": "cafe taste / value price",
+      "affinity": ["Bru", "filter coffee", "Nescafé RTD"],
+      "members": 12410
+    },
+    {
+      "id": "value-households",
+      "cardId": "R2",
+      "label": "Value household",
+      "rule": "Value households · 2+ adults · price-led last 3 buys",
+      "bounds": ["two or more adults", "price led the last three coffee buys", "not tea-only"],
+      "traits": ["pack sharer", "treat accountant", "label reader"],
+      "tension": "wants a treat / shares the pack",
+      "affinity": ["Bru", "family jar", "multipack"],
+      "members": 8104
+    },
+    {
+      "id": "cafe-switchers",
+      "cardId": "R3",
+      "label": "Cafe switcher",
+      "rule": "Cafe switchers · 1+ cafe coffee / week · tried canned",
+      "bounds": ["one or more cafe coffees a week", "has tried a canned coffee", "not tea-only"],
+      "traits": ["cafe identity", "skeptical of cans", "flavor vocabulary"],
+      "tension": "cafe identity / canned convenience",
+      "affinity": ["cafe counter", "filter coffee", "canned trial"],
+      "members": 3276
+    }
+  ],
+  "guide": {
+    "mains": [
+      {"id": "m1", "phase": "rapport", "text": "Walk me through a weekday morning drink."},
+      {"id": "m2", "phase": "rapport", "text": "Who else is in that moment with you?"},
+      {"id": "m3", "phase": "unprompted", "text": "When you want cold coffee out of home, what comes to mind first?"},
+      {"id": "m4", "phase": "unprompted", "text": "What have you tried and dropped?"},
+      {"id": "m5", "phase": "prompted", "text": "Here is Aroha. What is this for, in your week?"},
+      {"id": "m6", "phase": "prompted", "text": "What would make you pay cafe money for a can?"}
+    ],
+    "probes": [
+      {"id": "p1", "text": "What does that get you?", "when": "Any short answer"},
+      {"id": "p2", "text": "What would make this desk-safe?", "when": "Office context"},
+      {"id": "p3", "text": "Keep going. That contradicts the price line.", "when": "Tension"}
+    ]
+  },
+  "documents": [
+    {
+      "id": "T-14",
+      "kind": "transcript",
+      "cohortIds": ["office-sippers"],
+      "title": "Bengaluru office weekday",
+      "text": "Weekday morning is Bru or instant at the flat, then a cab. Cold coffee out of home means a can for the cab to the client site, not a cafe stop. I do not have a brand I trust in a can. Cafe coffee looks like a treat. A can looks like I packed breakfast. I can drink it at the desk and nobody asks if I am on a diet. Filter at a relative's house is a different drink. I will not pay cafe money unless the can tastes like that cafe cup and still looks ordinary on the desk."
+    },
+    {
+      "id": "T-06",
+      "kind": "transcript",
+      "cohortIds": ["office-sippers"],
+      "title": "Delhi desk and cab",
+      "text": "The morning drink is mine. My flatmate is asleep. Out of home, cold coffee is for the back seat before a meeting in Gurgaon. I tried a sweet can that tasted like a milkshake and dropped it after one week. What I want is coffee I can open without a performance. If the can is very pretty I feel I have to explain it. Desk-safe means quiet, not a cafe cup with foam."
+    },
+    {
+      "id": "T-31",
+      "kind": "transcript",
+      "cohortIds": ["office-sippers"],
+      "title": "Hyderabad campus canteen",
+      "text": "At the office canteen I still look for filter or Bru before I look for a can. Cold coffee from the machine is watery. A can is what I carry between buildings. I dropped a vanilla can because it did not taste like coffee. I would pay more only if the first sip is bitter enough to count as coffee and the can does not look like a protein drink."
+    },
+    {
+      "id": "T-22",
+      "kind": "transcript",
+      "cohortIds": ["value-households"],
+      "title": "Pune two-adult household",
+      "text": "Two adults, one jar of coffee, and a fight about who finished it. A treat is allowed on Sunday. A can for one person feels selfish unless it is on offer. The last three buys were the cheaper jar, then a multipack, then whatever was on the Blinkit discount. I want the taste of a cafe once in a while and I also have to share the house budget. Do not make it a single fancy can I cannot justify."
+    },
+    {
+      "id": "T-44",
+      "kind": "transcript",
+      "cohortIds": ["value-households"],
+      "title": "Kolkata shared pack",
+      "text": "My mother notices what comes into the fridge. A can I drink alone gets a comment. A multipack we both use does not. We dropped a sweet imported can because the price was a cafe price and the taste was sugar. Cold coffee out of home, for me, is still a roadside glass or Bru at the shop, not a brand can. If it is a treat, it has to be obviously shared."
+    },
+    {
+      "id": "T-21",
+      "kind": "transcript",
+      "cohortIds": ["cafe-switchers"],
+      "title": "Mumbai cafe week",
+      "text": "I drink cafe coffee at least twice a week. The can is what I try when I am late, and then I resent it. Canned coffee is not my coffee. It smells sweet before it smells like coffee. I have tried three cans. I remember the one that tasted burnt and the one that tasted like chocolate milk. Convenience is real. Identity is also real. I do not want the can to pretend it is the cafe."
+    },
+    {
+      "id": "T-51",
+      "kind": "transcript",
+      "cohortIds": ["cafe-switchers"],
+      "title": "Bengaluru third-cup comparison",
+      "text": "Filter at home, cafe near the office, can only in the airport. The airport can was cold and fine and forgettable. What I would pay cafe money for is a can that keeps the bitterness and skips the dessert flavour. I will not switch my cafe habit for a can that tastes like a shake. The trial was enough to know the category is not there yet."
+    },
+    {
+      "id": "R-882",
+      "kind": "review",
+      "cohortIds": ["office-sippers", "cafe-switchers"],
+      "title": "Blinkit RTD coffee review",
+      "text": "Tastes like medicine. I wanted cold coffee and got a protein shake. Will not buy again. The sweetness sits on top of a chalky note. This is not a desk drink and it is not a cafe drink."
+    },
+    {
+      "id": "R-104",
+      "kind": "review",
+      "cohortIds": ["office-sippers"],
+      "title": "Amazon can as breakfast",
+      "text": "I keep this in the office bag. It looks like I packed breakfast, which is what I want. Taste is thin. Better than the medicinal one. Still would not serve it to someone who just came from a cafe."
+    },
+    {
+      "id": "R-210",
+      "kind": "review",
+      "cohortIds": ["office-sippers", "value-households"],
+      "title": "Price against a cafe cup",
+      "text": "Ninety rupees for a can and one hundred forty for the cafe downstairs. The can loses. I will pay cafe money only when the can tastes like coffee rather than flavoured milk. Until then I buy the offer price or I skip."
+    },
+    {
+      "id": "R-301",
+      "kind": "review",
+      "cohortIds": ["value-households"],
+      "title": "Multipack for the house",
+      "text": "Bought the four-pack because both of us drink it. A single can feels like a personal luxury and I hear about it. Taste is acceptable if it is cold. Dropped the glass bottle because it was twice the money for the same sweet coffee."
+    },
+    {
+      "id": "R-410",
+      "kind": "review",
+      "cohortIds": ["office-sippers", "value-households"],
+      "title": "Kirana Bru versus can",
+      "text": "If I am near a kirana I ask for Bru or a coffee glass. The can is for when I cannot stop. Familiar taste beats a new brand I do not trust. Cold coffee from the fridge at home still starts with the jar we already know."
+    },
+    {
+      "id": "R-512",
+      "kind": "review",
+      "cohortIds": ["cafe-switchers", "office-sippers"],
+      "title": "Too sweet chemical finish",
+      "text": "First sip is sugar, finish is chemical. I wanted cold coffee, not dessert. Dropped after two cans. A cafe cup is bitter and short. This was long and sweet."
+    },
+    {
+      "id": "R-640",
+      "kind": "review",
+      "cohortIds": ["office-sippers"],
+      "title": "Nescafe RTD comparison",
+      "text": "Nescafé RTD is the can I recognise. It is not loved. It is known. I trust known more than a new name. It still tastes sweeter than filter. I drink it in the cab and I do not talk about it."
+    },
+    {
+      "id": "R-701",
+      "kind": "review",
+      "cohortIds": ["cafe-switchers"],
+      "title": "Not my coffee",
+      "text": "Tried it once between meetings. Canned coffee is not my coffee. Smell was confectionery. I went back to the cafe the same day. Convenience did not cover the loss of taste."
+    },
+    {
+      "id": "S-01",
+      "kind": "screener",
+      "cohortIds": ["office-sippers"],
+      "members": 12410,
+      "title": "Office sipper incidence",
+      "text": "Metro office drinkers age 25 to 34 who bought ready-to-drink coffee in the last 90 days. Tea-only respondents are a hard out. Member count in this gold slice is 12410. Incidence is higher in Bengaluru, Delhi, and Hyderabad than in smaller cities."
+    },
+    {
+      "id": "S-02",
+      "kind": "screener",
+      "cohortIds": ["value-households"],
+      "members": 8104,
+      "title": "Value household incidence",
+      "text": "Households with two or more adults whose last three coffee buys were price-led. Tea-only is a hard out. Member count in this gold slice is 8104. Shared packs outnumber single cans in this set."
+    },
+    {
+      "id": "S-03",
+      "kind": "screener",
+      "cohortIds": ["cafe-switchers"],
+      "members": 3276,
+      "title": "Cafe switcher incidence",
+      "text": "People who drink cafe coffee at least once a week and have tried a canned coffee. Tea-only is a hard out. Member count in this gold slice is 3276. The base is smaller than the office and value sets."
+    },
+    {
+      "id": "S-04",
+      "kind": "screener",
+      "cohortIds": ["office-sippers", "value-households", "cafe-switchers"],
+      "title": "Tea-only hard out",
+      "text": "Respondents who do not drink coffee are out of scope. Do not interview them as coffee buyers. A question that is only about tea, with no coffee, is outside the screener."
+    }
+  ]
+}
