@@ -8,7 +8,7 @@ STOP = {
     "should", "there", "their", "here", "out", "how", "who", "why", "its",
 }
 
-SOURCE_KINDS = {"transcript", "review", "screener"}
+SOURCE_KINDS = {"transcript", "review", "screener", "sales"}
 
 
 def tokenize(text: str) -> list[str]:

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from synthetic_research.engine import ResearchEngine
 from synthetic_research.gates import ResearchError
+from synthetic_research.synthesis import format_synthesis
 
 
 def _note(events: list[str], line: str) -> None:
@@ -79,9 +80,33 @@ def _phase(engine: ResearchEngine, session_id: str, cohort_id: str) -> str:
 def _format_turn(turn: dict) -> str:
     if turn["abstain"]:
         return f"{turn['phase']}: Abstain ({turn['abstainReason']}) on “{turn['question']}”"
+    if turn.get("source") == "system":
+        names = ", ".join(turn.get("systemDatasets") or []) or "system"
+        return (
+            f"{turn['phase']}: System ({names})\n  A: {turn['reply']}\n  Evidence: none"
+            f"{_meta_suffix(turn)}"
+        )
     chips = ", ".join(turn["evidenceIds"])
     improved = " improved" if turn["improved"] else ""
-    return f"{turn['phase']}{improved}: Q: {turn['question']}\n  A: {turn['reply']}\n  Evidence: {chips}"
+    return (
+        f"{turn['phase']}{improved}: Q: {turn['question']}\n  A: {turn['reply']}\n  Evidence: {chips}"
+        f"{_meta_suffix(turn)}"
+    )
+
+
+def _meta_suffix(turn: dict) -> str:
+    lines = []
+    confidence = turn.get("confidence") or {}
+    if confidence:
+        lines.append(f"  Confidence: {confidence.get('score')} {confidence.get('label')}.")
+    for call in turn.get("mcp") or []:
+        status = "ok" if call.get("ok") else call.get("error")
+        lines.append(f"  MCP {call.get('database')} {call.get('tool')}: {status}")
+    for line in format_synthesis(turn.get("synthesis")):
+        lines.append(f"  {line}")
+    if not lines:
+        return ""
+    return "\n" + "\n".join(lines)
 
 
 def interview_cohort(engine: ResearchEngine, session_id: str, pack: dict, cohort_id: str, events: list[str]) -> None:
@@ -140,7 +165,7 @@ def run_campaign(root: Path, pack_path: Path, engine: ResearchEngine) -> Path:
         _note(events, 
             f"Card {card['cardId']} {card['label']}. Tension: {card['tension']}. "
             f"Provenance: {provenance['transcripts']} transcripts, {provenance['reviews']} reviews, "
-            f"{provenance['members']} members."
+            f"{provenance['sales']} sales rows, {provenance['members']} members."
         )
     probe = engine.add_probe(session["sessionId"], "What would make this desk-safe?")
     _note(events, f"Probe added for this session only: {probe['text']}")

@@ -18,7 +18,7 @@ def retrieve_evidence(
     *,
     cohort_id: str,
     query_vector: list[float] | None = None,
-    limit: int = 4,
+    limit: int | None = 8,
 ) -> list[dict]:
     index = build_index(documents)
     lexical_hits = retrieve(index, query, cohort_id=cohort_id, limit=max(len(index["docs"]), 1))
@@ -40,7 +40,8 @@ def retrieve_evidence(
                 continue
             score = lexical_score
         ranked.append((score, semantic, document))
-    ranked.sort(key=lambda row: row[0], reverse=True)
+    ranked.sort(key=lambda row: (-row[0], row[2].get("id") or ""))
+    chosen = ranked if limit is None else ranked[:limit]
     return [
         {
             "id": document["id"],
@@ -51,5 +52,5 @@ def retrieve_evidence(
             "score": round(score, 4),
             "semantic": round(semantic, 4),
         }
-        for score, semantic, document in ranked[:limit]
+        for score, semantic, document in chosen
     ]

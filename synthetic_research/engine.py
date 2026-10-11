@@ -1,9 +1,10 @@
 import json
+import os
 import re
 import uuid
 from datetime import datetime, timezone
 
-from synthetic_research.corpus import corpus_hash, find_pii, validate_campaign
+from synthetic_research.corpus import campaign_sources, corpus_hash, find_pii, validate_campaign
 from synthetic_research.gates import (
     ResearchError,
     assert_brand_allowed,
@@ -14,21 +15,140 @@ from synthetic_research.gates import (
     public_evidence,
     quote_is_verbatim,
 )
-from synthetic_research.retrieve import SOURCE_KINDS
+from synthetic_research.grounding import grounding_confidence, lock_citations
+from synthetic_research.knowledge import build_graph, chunk_text, read_upload
+from synthetic_research.retrieve import SOURCE_KINDS, tokenize
+from synthetic_research.s3_log import log_question
 from synthetic_research.search import retrieve_evidence
+from synthetic_research.synthesis import (
+    blank_synthesis,
+    cited_ids,
+    fallback_plan,
+    model_respects_plan,
+    plan_synthesis,
+    public_synthesis,
+)
 
 TURN_CAP = 10
 
 
+def should_follow_up(turn: dict, turns_left: int) -> bool:
+    if turn.get("abstain") or turns_left < 1:
+        return False
+    return len(str(turn.get("reply") or "").split()) <= 60
+
+
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _mcp_points(documents: list[dict]) -> list[dict]:
+    points = []
+    for document in documents:
+        vector = document.get("vector")
+        if not document.get("id") or not isinstance(vector, list) or not vector:
+            continue
+        points.append(
+            {
+                "id": document["id"],
+                "text": str(document.get("text") or "")[:2000],
+                "vector": vector,
+            }
+        )
+    return points
+
+
+def _content_type(filename: str) -> str:
+    suffix = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    return {
+        "txt": "text/plain",
+        "md": "text/markdown",
+        "csv": "text/csv",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pdf": "application/pdf",
+    }.get(suffix, "application/octet-stream")
+
+
+def _vector_count(index: dict | None) -> int:
+    if not index:
+        return 0
+    return sum(1 for document in index.get("documents") or [] if document.get("vector"))
+
+
+def _uploaded_vectors(index: dict | None) -> int:
+    if not index:
+        return 0
+    return sum(1 for document in index.get("documents") or [] if document.get("parentId") and document.get("vector"))
+
+
+def _replace_uploads_with_chunks(session: dict) -> None:
+    cohort_ids = [rule["id"] for rule in session.get("cohortRules") or []]
+    kept = [document for document in session.get("documents") or [] if not document.get("uploaded")]
+    for record in session.get("knowledgeFiles") or []:
+        text = record.get("text") or ""
+        if not text:
+            continue
+        for index, chunk in enumerate(chunk_text(text), start=1):
+            kept.append(
+                {
+                    "id": f"{record['id']}-c{index}",
+                    "kind": "transcript",
+                    "cohortIds": cohort_ids,
+                    "title": f"{record.get('filename') or record['id']} · part {index}",
+                    "text": chunk,
+                    "uploaded": True,
+                    "parentId": record["id"],
+                }
+            )
+    session["documents"] = kept
+
+
+def _merge_graph_evidence(session: dict, question: str, evidence: list[dict]) -> list[dict]:
+    graph = session.get("knowledgeGraph") or {}
+    tokens = set(tokenize(question))
+    if not tokens or not graph.get("edges"):
+        return evidence
+    matched = set()
+    for node in graph.get("nodes") or []:
+        if node.get("kind") != "entity":
+            continue
+        label = set(tokenize(node.get("label") or ""))
+        if label and label <= tokens:
+            matched.add(node.get("id"))
+    if not matched:
+        return evidence
+    document_ids = {
+        edge.get("from")
+        for edge in graph.get("edges") or []
+        if edge.get("relation") == "mentions" and edge.get("to") in matched
+    }
+    by_id = {document.get("id"): document for document in session.get("documents") or []}
+    seen = {item.get("id") for item in evidence}
+    merged = list(evidence)
+    for document_id in sorted(item for item in document_ids if item):
+        document = by_id.get(document_id)
+        if not document or document_id in seen:
+            continue
+        merged.append(
+            {
+                "id": document["id"],
+                "kind": document.get("kind"),
+                "title": document.get("title", ""),
+                "text": document.get("text", ""),
+                "cohortIds": list(document.get("cohortIds") or []),
+                "score": 0.55,
+            }
+        )
+        seen.add(document_id)
+    return merged
 
 
 class ResearchEngine:
-    def __init__(self, store, llm, embedder=None):
+    def __init__(self, store, llm, embedder=None, mcp=None):
         self.store = store
         self.llm = llm
         self.embedder = embedder
+        self.mcp = mcp
 
     def open(self, campaign: dict, actor: str) -> dict:
         validate_campaign(campaign)
@@ -50,7 +170,7 @@ class ResearchEngine:
             "marketPack": campaign["marketPack"],
             "cohortRules": [dict(rule) for rule in campaign["cohorts"]],
             "guideTemplate": campaign["guide"],
-            "documents": campaign["documents"],
+            "documents": campaign_sources(campaign),
             "grant": None,
             "insightLocked": True,
             "cards": [],
@@ -95,6 +215,109 @@ class ResearchEngine:
             documents=len(documents),
             retrieval=retrieval,
             corpusHash=session["corpusHash"],
+        )
+        return self.store.write(session)
+
+    def list_knowledge(self, session_id: str) -> list[dict]:
+        session = self._open_session(session_id)
+        listed = []
+        for item in session.get("knowledgeFiles") or []:
+            listed.append({key: value for key, value in item.items() if key != "text"})
+        return listed
+
+    def add_knowledge(self, session_id: str, filename: str, payload: bytes, actor: str) -> dict:
+        session = self._open_session(session_id)
+        if session.get("status") == "closed":
+            raise ResearchError("SESSION_CLOSED", "This session is closed.")
+        text = read_upload(filename, payload)
+        if find_pii([{"id": "upload", "title": filename, "text": text}]):
+            raise ResearchError("PII_REJECTED", f"{filename} contains contact data and was not added.")
+        files = session.setdefault("knowledgeFiles", [])
+        file_id = f"UP-{len(files) + 1:03d}"
+        cohort_ids = [rule["id"] for rule in session.get("cohortRules") or []]
+        session.setdefault("documents", []).append(
+            {
+                "id": file_id,
+                "kind": "transcript",
+                "cohortIds": cohort_ids,
+                "title": filename,
+                "text": text,
+                "uploaded": True,
+            }
+        )
+        record = {
+            "id": file_id,
+            "filename": filename,
+            "sizeBytes": len(payload),
+            "contentType": _content_type(filename),
+            "uploadedAt": _now(),
+            "uploadedBy": actor,
+            "status": "received",
+            "statusLabel": "Received. Vectors and the graph have not been built yet.",
+            "text": text,
+        }
+        files.append(record)
+        session["knowledgeReady"] = False
+        self._audit(session_id, "KNOWLEDGE_ADDED", fileId=file_id, filename=filename, actor=actor)
+        self.store.write(session)
+        return record
+
+    def prepare_knowledge(self, session_id: str, steward: str) -> dict:
+        session = self._open_session(session_id)
+        uploads = session.get("knowledgeFiles") or []
+        if not uploads:
+            raise ResearchError("KNOWLEDGE_EMPTY", "Upload knowledge before building vectors and a graph.")
+        name = str(steward or "").strip() or session.get("actor") or "Meera"
+        _replace_uploads_with_chunks(session)
+        self.store.write(session)
+        if session.get("grant") and session["grant"].get("status") == "active":
+            self.refresh(session_id, steward=name)
+            session = self.store.read(session_id)
+            retrieval = session["grant"].get("retrieval") or "lexical"
+            warning = session["grant"].get("embeddingWarning")
+            vector_count = _vector_count(self.store.read_index(session_id))
+        else:
+            granted = self.grant(session_id, f"knowledge-{session_id[:8]}", steward=name)
+            retrieval = granted["grant"].get("retrieval") or "lexical"
+            warning = granted["grant"].get("embeddingWarning")
+            vector_count = _vector_count(self.store.read_index(session_id))
+            session = granted
+        chunks = [doc for doc in session.get("documents") or [] if doc.get("parentId")]
+        graph = build_graph(chunks)
+        vector_count = _uploaded_vectors(self.store.read_index(session_id))
+        if vector_count < 1:
+            raise ResearchError(
+                "VECTORS_MISSING",
+                warning or "The embedding service did not return a vector for the uploaded knowledge.",
+            )
+        for record in session.get("knowledgeFiles") or []:
+            record["status"] = "ready"
+            record["statusLabel"] = "Vectors and the graph include this file."
+        session["knowledgeReady"] = True
+        session["knowledgeGraph"] = graph
+        indexed = (self.store.read_index(session_id) or {}).get("documents") or []
+        mcp_rows = self._index_mcp(session, indexed, graph)
+        vector_store = "session"
+        if any(row.get("ok") and row.get("database") == "vector" for row in mcp_rows):
+            vector_store = "mcp"
+        session["knowledgeIndex"] = {
+            "ready": True,
+            "vectorCount": vector_count,
+            "vectorStore": vector_store,
+            "retrieval": retrieval,
+            "graphNodes": len(graph["nodes"]),
+            "graphEdges": len(graph["edges"]),
+            "edges": graph["edges"][:12],
+            "warning": warning,
+            "mcp": [_public_mcp(row) for row in mcp_rows],
+        }
+        self._audit(
+            session_id,
+            "KNOWLEDGE_PREPARED",
+            vectors=vector_count,
+            graphNodes=len(graph["nodes"]),
+            graphEdges=len(graph["edges"]),
+            retrieval=retrieval,
         )
         return self.store.write(session)
 
@@ -169,6 +392,7 @@ class ResearchEngine:
                     "provenance": {
                         "transcripts": sum(1 for doc in docs if doc["kind"] == "transcript"),
                         "reviews": sum(1 for doc in docs if doc["kind"] == "review"),
+                        "sales": sum(1 for doc in docs if doc["kind"] == "sales"),
                         "members": members,
                     },
                 }
@@ -240,12 +464,57 @@ class ResearchEngine:
         if interview["turnsUsed"] >= interview["turnCap"]:
             raise ResearchError("TURN_CAP", "The ten-turn cap is reached.")
         assert_brand_allowed(interview["phase"], question, session["kit"]["brandAlias"])
-        turn = self._answer_turn(session, interview, question=str(question), instruction="")
+        try:
+            turn = self._answer_turn(session, interview, question=str(question), instruction="")
+        except Exception as error:
+            log_question(
+                {
+                    "at": _now(),
+                    "sessionId": session.get("sessionId"),
+                    "campaignId": session.get("campaignId"),
+                    "interviewId": interview.get("interviewId"),
+                    "cohortId": interview.get("cohortId"),
+                    "phase": interview.get("phase"),
+                    "question": str(question),
+                    "error": str(error)[:500],
+                    "model": os.environ.get("DEEPINFRA_FAST_MODEL") or "",
+                }
+            )
+            raise
         interview["turns"].append(turn)
         interview["turnsUsed"] += 1
         interview["kitLocked"] = kit_locked(interview["phase"])
         self.store.write(session)
+        self._log_question(session, interview, turn)
         return turn
+
+    def follow_up_question(self, session_id: str, cohort_id: str, turn: dict) -> str | None:
+        session = self._insight_session(session_id)
+        interview = _open_interview(session, cohort_id)
+        turns_left = interview["turnCap"] - interview["turnsUsed"]
+        if not should_follow_up(turn, turns_left):
+            return None
+        probes = [probe["text"] for probe in (session.get("guide") or {}).get("probes") or []]
+        if not hasattr(self.llm, "follow_up"):
+            return probes[0] if probes else None
+        raw = self.llm.follow_up(
+            json.dumps(
+                {
+                    "phase": interview["phase"],
+                    "brandAllowed": interview["phase"] == "prompted",
+                    "brandAlias": session["kit"]["brandAlias"],
+                    "probes": probes,
+                    "question": turn["question"],
+                    "reply": turn["reply"],
+                }
+            )
+        )
+        question = str(raw.get("question") or "").strip()
+        if not question:
+            return None
+        if kit_locked(interview["phase"]) and mentions_brand(question, session["kit"]["brandAlias"]):
+            return probes[0] if probes else None
+        return question
 
     def improve(self, session_id: str, cohort_id: str, instruction: str) -> dict:
         session = self._insight_session(session_id)
@@ -260,16 +529,52 @@ class ResearchEngine:
             instruction=instruction,
         )
         replacement["id"] = current["id"]
-        replacement["improved"] = True
+        changed = replacement["reply"] != current["reply"] or replacement["evidenceIds"] != current["evidenceIds"]
+        replacement["improved"] = changed
         index = next(i for i, turn in enumerate(interview["turns"]) if turn["id"] == current["id"])
         interview["turns"][index] = replacement
         self.store.write(session)
+        self._log_question(session, interview, replacement)
         return replacement
+
+    def _log_question(self, session: dict, interview: dict, turn: dict) -> None:
+        try:
+            documents = _log_documents(self, session, turn)
+            log_question(
+                {
+                    "at": turn.get("createdAt"),
+                    "turnId": turn.get("id"),
+                    "sessionId": session.get("sessionId"),
+                    "campaignId": session.get("campaignId"),
+                    "interviewId": interview.get("interviewId"),
+                    "cohortId": interview.get("cohortId"),
+                    "phase": turn.get("phase"),
+                    "question": turn.get("question"),
+                    "reply": turn.get("reply"),
+                    "abstain": bool(turn.get("abstain")),
+                    "abstainReason": turn.get("abstainReason"),
+                    "evidenceIds": list(turn.get("evidenceIds") or []),
+                    "documents": documents,
+                    "synthesis": turn.get("synthesis") or {},
+                    "confidence": turn.get("confidence") or {},
+                    "mcp": list(turn.get("mcp") or []),
+                    "source": turn.get("source"),
+                    "improved": bool(turn.get("improved")),
+                    "model": os.environ.get("DEEPINFRA_FAST_MODEL") or "",
+                }
+            )
+        except Exception as error:  # noqa: BLE001
+            print(f"[s3-log] {type(error).__name__}: {error}", flush=True)
 
     def open_evidence(self, session_id: str, evidence_id: str) -> dict:
         session = self._insight_session(session_id)
         payload = self._index(session)
         document = next((doc for doc in payload["documents"] if doc["id"] == evidence_id), None)
+        if not document:
+            document = next(
+                (doc for doc in session.get("externalEvidence") or [] if doc["id"] == evidence_id),
+                None,
+            )
         if not document:
             raise ResearchError("EVIDENCE_MISSING", f"Evidence {evidence_id} is not in this grant.")
         return public_evidence(document, session["grant"]["grantId"])
@@ -339,6 +644,7 @@ class ResearchEngine:
             for turn in interview["turns"]:
                 if turn["abstain"] or not turn["evidenceIds"]:
                     continue
+                synthesis = turn.get("synthesis") or {}
                 cited.append(
                     {
                         "cohortId": interview["cohortId"],
@@ -346,6 +652,8 @@ class ResearchEngine:
                         "question": turn["question"],
                         "reply": turn["reply"],
                         "evidenceIds": turn["evidenceIds"],
+                        "directDocumentId": synthesis.get("directDocumentId"),
+                        "conflicts": synthesis.get("conflicts") or [],
                     }
                 )
         prompt = json.dumps(
@@ -528,7 +836,9 @@ class ResearchEngine:
     def _answer_turn(self, session: dict, interview: dict, *, question: str, instruction: str) -> dict:
         card = _card(session, interview["cohortId"])
         outside = _outside_bounds(question, card["bounds"])
-        evidence = []
+        evidence: list[dict] = []
+        mcp_results: list[dict] = []
+        plan = plan_synthesis(question, [])
         if not outside:
             payload = self._index(session)
             query_vector = None
@@ -539,19 +849,83 @@ class ResearchEngine:
                 question,
                 cohort_id=interview["cohortId"],
                 query_vector=query_vector,
+                limit=None,
             )
+            evidence = [item for item in evidence if item.get("kind") in {"transcript", "review", "sales"}]
+            evidence = _merge_graph_evidence(session, question, evidence)
+            group = _synthesis_group(payload["documents"], interview["cohortId"], evidence)
+            plan = plan_synthesis(question, group, retrieved_ids={item["id"] for item in evidence})
+            transcripts_sufficient = self._transcripts_sufficient(question, evidence)
+            if self.mcp is not None:
+                if hasattr(self.mcp, "stored") and not self.mcp.stored(session["sessionId"]):
+                    mcp_rows = self._index_mcp(session, payload["documents"], session.get("knowledgeGraph") or {})
+                    if mcp_rows:
+                        index = session.setdefault("knowledgeIndex", {})
+                        index["mcp"] = [_public_mcp(row) for row in mcp_rows]
+                        if any(row.get("ok") and row.get("database") == "vector" for row in mcp_rows):
+                            index["vectorStore"] = "mcp"
+                        self.store.write(session)
+                if not transcripts_sufficient:
+                    mcp_results = list(
+                        self.mcp.gather(
+                            question,
+                            interview["cohortId"],
+                            session_id=session["sessionId"],
+                            query_vector=query_vector,
+                        )
+                        or []
+                    )
+                    external = [
+                        item
+                        for item in _external_evidence(session, mcp_results)
+                        if item.get("database") == "web"
+                    ]
+                    transcripts_answer = plan["mode"] in {"direct", "conflict"} and bool(plan.get("reply"))
+                    if external and not transcripts_answer:
+                        session.setdefault("externalEvidence", []).extend(external)
+                        evidence = [*evidence, *external]
+                        group = _synthesis_group(payload["documents"], interview["cohortId"], evidence)
+                        plan = plan_synthesis(question, group, retrieved_ids={item["id"] for item in evidence})
+            if plan["mode"] in {"direct", "conflict"} and plan.get("reply") and not instruction:
+                stated = _stated_turn(
+                    session,
+                    interview,
+                    question,
+                    plan,
+                    evidence,
+                    group,
+                    mcp_results,
+                )
+                if stated is not None:
+                    return stated
+        if outside:
+            return _empty_turn(interview, question, "out_of_screener_bounds", mcp_results)
+        if plan.get("conflicts") or (plan["mode"] in {"direct", "conflict"} and plan.get("reply")):
+            evidence = _ordered_evidence(evidence, group, _evidence_plan(plan))
         if not evidence:
-            return {
-                "id": str(uuid.uuid4()),
-                "phase": interview["phase"],
-                "question": question,
-                "abstain": True,
-                "abstainReason": "out_of_screener_bounds" if outside else "no_evidence",
-                "reply": "",
-                "evidenceIds": [],
-                "retrievedIds": [],
-                "improved": False,
-            }
+            return self._answer_from_system(session, interview, card, question, instruction, mcp_results)
+        return self._answer_from_model(
+            session,
+            interview,
+            card,
+            question,
+            instruction,
+            evidence,
+            mcp_results,
+            plan,
+        )
+
+    def _answer_from_model(
+        self,
+        session: dict,
+        interview: dict,
+        card: dict,
+        question: str,
+        instruction: str,
+        evidence: list[dict],
+        mcp_results: list[dict],
+        plan: dict,
+    ) -> dict:
         raw = self.llm.respondent(
             json.dumps(
                 {
@@ -563,6 +937,8 @@ class ResearchEngine:
                     "marketPack": session["marketPack"],
                     "question": question,
                     "instruction": instruction,
+                    "task": plan.get("mode") or "indirect",
+                    "synthesis": public_synthesis(plan),
                     "evidence": [
                         {"id": item["id"], "kind": item["kind"], "text": item["text"]} for item in evidence
                     ],
@@ -570,12 +946,32 @@ class ResearchEngine:
                 indent=2,
             )
         )
-        allowed = {item["id"] for item in evidence}
+        allowed = {item["id"] for item in evidence if not str(item.get("id") or "").startswith("GRAPH-")}
         evidence_ids = [item for item in raw.get("evidenceIds") or [] if item in allowed]
         reply = str(raw.get("reply") or "").strip()
+        reply, evidence_ids, grounding = self._verify_reply(question, reply, evidence_ids, evidence)
         leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
         pii = find_pii([{"id": "reply", "title": "", "text": reply}])
-        abstain = bool(raw.get("abstain")) or not evidence_ids or not reply or leaked or bool(pii)
+        keeps_plan = model_respects_plan(plan, reply, evidence_ids)
+        abstain = bool(raw.get("abstain")) or not evidence_ids or not reply or leaked or bool(pii) or not keeps_plan
+        restored = fallback_plan(plan)
+        if abstain and not leaked and not pii and restored.get("reply"):
+            group = [
+                {
+                    "id": item["id"],
+                    "kind": item.get("kind"),
+                    "title": item.get("title", ""),
+                    "text": item.get("text", ""),
+                    "cohortIds": item.get("cohortIds", []),
+                    "score": item.get("score") or 0,
+                }
+                for item in evidence
+            ]
+            stated = _stated_turn(session, interview, question, restored, evidence, group, mcp_results)
+            if stated is not None:
+                return stated
+        if abstain and not leaked and not pii:
+            return self._answer_from_system(session, interview, card, question, instruction, mcp_results)
         reason = None
         if abstain:
             if leaked:
@@ -584,17 +980,133 @@ class ResearchEngine:
                 reason = "pii"
             else:
                 reason = "uncited"
-        return {
-            "id": str(uuid.uuid4()),
-            "phase": interview["phase"],
-            "question": question,
-            "abstain": abstain,
-            "abstainReason": reason,
-            "reply": "" if abstain else reply,
-            "evidenceIds": [] if abstain else evidence_ids,
-            "retrievedIds": [item["id"] for item in evidence],
-            "improved": False,
-        }
+        synthesis = public_synthesis(plan) if not abstain else blank_synthesis("none")
+        if not abstain and plan.get("mode") == "indirect":
+            synthesis["mode"] = "indirect"
+        if not abstain:
+            if grounding is None:
+                evidence_ids = cited_ids(plan, evidence_ids)
+            else:
+                evidence_ids = [item for item in evidence_ids if item in allowed]
+        turn = _finish_turn(
+            interview,
+            question,
+            abstain=abstain,
+            reason=reason,
+            reply="" if abstain else reply,
+            evidence_ids=[] if abstain else evidence_ids,
+            evidence=evidence,
+            mcp_results=mcp_results,
+            source=None,
+            synthesis=synthesis,
+        )
+        if grounding is not None and not abstain:
+            used_web = any(str(item).startswith("WEB-") for item in evidence_ids)
+            turn["confidence"] = grounding_confidence(
+                supported=grounding["supported"],
+                removed=grounding["removed"],
+                used_web=used_web,
+            )
+            turn["grounding"] = {
+                "supported": grounding["supported"],
+                "removed": grounding["removed"],
+            }
+        if not abstain and plan.get("mode") in {"direct", "conflict"} and grounding is None:
+            _note_direct_basis(turn, plan)
+        return turn
+
+    def _transcripts_sufficient(self, question: str, evidence: list[dict]) -> bool:
+        if not evidence or not hasattr(self.llm, "grade_transcripts"):
+            return False
+        payload = [
+            {"id": item["id"], "text": str(item.get("text") or "")[:500]}
+            for item in evidence[:40]
+            if item.get("id")
+        ]
+        try:
+            grade = self.llm.grade_transcripts(question, payload)
+        except Exception as error:  # noqa: BLE001
+            print(f"[grounding] grade failed: {error}", flush=True)
+            return False
+        return bool(grade.get("sufficient"))
+
+    def _verify_reply(
+        self,
+        question: str,
+        reply: str,
+        evidence_ids: list[str],
+        evidence: list[dict],
+    ) -> tuple[str, list[str], dict | None]:
+        allowed = {item["id"] for item in evidence if item.get("id") and not str(item["id"]).startswith("GRAPH-")}
+        checked: dict | None = None
+        if reply and hasattr(self.llm, "verify_reply"):
+            documents = [
+                {"id": item["id"], "text": str(item.get("text") or "")[:1200]}
+                for item in evidence
+                if item.get("id") in allowed
+            ]
+            try:
+                checked = self.llm.verify_reply(question, reply, documents)
+            except Exception as error:  # noqa: BLE001
+                print(f"[grounding] verify failed: {error}", flush=True)
+                checked = None
+        if isinstance(checked, dict):
+            revised = str(checked.get("reply") or "").strip()
+            if revised:
+                reply = revised
+            if isinstance(checked.get("evidenceIds"), list):
+                evidence_ids = [item for item in checked["evidenceIds"] if item in allowed]
+        reply, evidence_ids, removed = lock_citations(reply, evidence_ids, allowed)
+        if checked is None:
+            return reply, evidence_ids, None
+        return reply, evidence_ids, {"supported": bool(checked.get("supported")), "removed": removed}
+
+    def _answer_from_system(
+        self,
+        session: dict,
+        interview: dict,
+        card: dict,
+        question: str,
+        instruction: str,
+        mcp_results: list[dict],
+    ) -> dict:
+        datasets = _system_datasets(session, interview["cohortId"])
+        raw = self.llm.respondent(
+            json.dumps(
+                {
+                    "source": "system",
+                    "phase": interview["phase"],
+                    "brandAlias": session["kit"]["brandAlias"],
+                    "brandAllowed": interview["phase"] == "prompted",
+                    "bounds": card["bounds"],
+                    "tension": card["tension"],
+                    "marketPack": session["marketPack"],
+                    "question": question,
+                    "instruction": instruction,
+                    "evidence": [],
+                    "systemDatasets": datasets,
+                },
+                indent=2,
+            )
+        )
+        reply = _system_disclosure(str(raw.get("reply") or "").strip())
+        leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
+        pii = find_pii([{"id": "reply", "title": "", "text": reply}])
+        if leaked or pii:
+            return _empty_turn(interview, question, "brand_locked" if leaked else "pii", mcp_results)
+        turn = _finish_turn(
+            interview,
+            question,
+            abstain=False,
+            reason=None,
+            reply=reply,
+            evidence_ids=[],
+            evidence=[],
+            mcp_results=mcp_results,
+            source="system",
+        )
+        turn["systemDatasets"] = sorted({row["datasetId"] for row in datasets if row.get("datasetId")})
+        return turn
 
     def _open_session(self, session_id: str) -> dict:
         session = self.store.read(session_id)
@@ -637,6 +1149,335 @@ class ResearchEngine:
                 copy["vector"] = vectors[index]
             indexed.append(copy)
         return indexed, retrieval, warning
+
+    def _index_mcp(self, session: dict, documents: list[dict], graph: dict) -> list[dict]:
+        if self.mcp is None or not hasattr(self.mcp, "index_knowledge"):
+            return []
+        try:
+            return list(self.mcp.index_knowledge(session["sessionId"], _mcp_points(documents), graph or {}) or [])
+        except Exception as error:
+            return [
+                {
+                    "database": "vector",
+                    "server": "session-knowledge",
+                    "tool": "vector_upsert",
+                    "ok": False,
+                    "text": "",
+                    "url": "",
+                    "error": str(error)[:180],
+                }
+            ]
+
+
+def _synthesis_group(documents: list[dict], cohort_id: str, evidence: list[dict]) -> list[dict]:
+    grouped = []
+    seen = set()
+    for document in documents:
+        if document.get("kind") not in SOURCE_KINDS:
+            continue
+        if cohort_id not in (document.get("cohortIds") or []):
+            continue
+        if not document.get("id") or document["id"] in seen:
+            continue
+        grouped.append(document)
+        seen.add(document["id"])
+    for item in evidence:
+        if item.get("id") and item["id"] not in seen:
+            grouped.append(item)
+            seen.add(item["id"])
+    return grouped
+
+
+def _evidence_plan(plan: dict) -> dict:
+    evidence_ids = []
+    for document_id in [*(plan.get("evidenceIds") or []), *(plan.get("fallbackEvidenceIds") or [])]:
+        if document_id and document_id not in evidence_ids:
+            evidence_ids.append(document_id)
+    for conflict in plan.get("conflicts") or []:
+        for side in conflict.get("sides") or []:
+            for document_id in side.get("documentIds") or []:
+                if document_id not in evidence_ids:
+                    evidence_ids.append(document_id)
+    return {**plan, "evidenceIds": evidence_ids}
+
+
+def _ordered_evidence(retrieved: list[dict], group: list[dict], plan: dict) -> list[dict]:
+    by_id: dict[str, dict] = {}
+    for document in [*retrieved, *group]:
+        document_id = document.get("id")
+        if not document_id or document_id in by_id:
+            continue
+        by_id[document_id] = {
+            "id": document_id,
+            "kind": document.get("kind"),
+            "title": document.get("title", ""),
+            "text": document.get("text", ""),
+            "cohortIds": list(document.get("cohortIds") or []),
+            "score": float(document.get("score") or 0),
+            "database": document.get("database"),
+            "url": document.get("url") or "",
+        }
+    for row in plan.get("ranked") or []:
+        document_id = row.get("id")
+        if document_id not in by_id or row.get("relation") != "direct":
+            continue
+        by_id[document_id]["score"] = max(by_id[document_id]["score"], min(1.0, float(row.get("score") or 0)))
+    if plan.get("mode") in {"direct", "conflict"}:
+        for document_id in plan.get("evidenceIds") or []:
+            if document_id in by_id:
+                by_id[document_id]["score"] = max(by_id[document_id]["score"], 0.55)
+    elif plan.get("conflicts"):
+        for document_id in plan.get("evidenceIds") or []:
+            if document_id in by_id and by_id[document_id]["score"] <= 0:
+                by_id[document_id]["score"] = 0.35
+    ordered = []
+    seen = set()
+    for document_id in plan.get("evidenceIds") or []:
+        if document_id in by_id and document_id not in seen:
+            ordered.append(by_id[document_id])
+            seen.add(document_id)
+    for item in retrieved:
+        document_id = item.get("id")
+        if document_id in by_id and document_id not in seen:
+            ordered.append(by_id[document_id])
+            seen.add(document_id)
+    return ordered
+
+
+def _stated_turn(
+    session: dict,
+    interview: dict,
+    question: str,
+    plan: dict,
+    evidence: list[dict],
+    group: list[dict],
+    mcp_results: list[dict],
+) -> dict | None:
+    reply = str(plan.get("reply") or "").strip()
+    evidence_ids = [item for item in plan.get("evidenceIds") or [] if item]
+    if not reply or not evidence_ids:
+        return None
+    leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
+    pii = find_pii([{"id": "reply", "title": "", "text": reply}])
+    if leaked or pii:
+        return _empty_turn(interview, question, "brand_locked" if leaked else "pii", mcp_results)
+    turn = _finish_turn(
+        interview,
+        question,
+        abstain=False,
+        reason=None,
+        reply=reply,
+        evidence_ids=evidence_ids,
+        evidence=_ordered_evidence(evidence, group, plan),
+        mcp_results=mcp_results,
+        source=None,
+        synthesis=public_synthesis(plan),
+    )
+    _note_direct_basis(turn, plan)
+    return turn
+
+
+def _note_direct_basis(turn: dict, plan: dict) -> None:
+    confidence = dict(turn.get("confidence") or {})
+    if plan.get("mode") == "direct" and plan.get("directDocumentId"):
+        confidence["basis"] = f"direct answer in {plan['directDocumentId']}"
+    elif plan.get("mode") == "conflict":
+        confidence["basis"] = "direct answers in conflict"
+    turn["confidence"] = confidence
+
+
+def _empty_turn(interview: dict, question: str, reason: str, mcp_results: list[dict] | None = None) -> dict:
+    return _finish_turn(
+        interview,
+        question,
+        abstain=True,
+        reason=reason,
+        reply="",
+        evidence_ids=[],
+        evidence=[],
+        mcp_results=mcp_results or [],
+        source=None,
+    )
+
+
+def _log_documents(engine: ResearchEngine, session: dict, turn: dict) -> list[dict]:
+    by_id: dict[str, dict] = {}
+    for document in session.get("documents") or []:
+        if document.get("id"):
+            by_id[document["id"]] = document
+    for document in session.get("externalEvidence") or []:
+        if document.get("id"):
+            by_id[document["id"]] = document
+    indexed = engine.store.read_index(session["sessionId"]) or {}
+    for document in indexed.get("documents") or []:
+        if document.get("id") and document["id"] not in by_id:
+            by_id[document["id"]] = document
+    cited = set(turn.get("evidenceIds") or [])
+    ordered = list(turn.get("retrievedIds") or [])
+    for document_id in cited:
+        if document_id not in ordered:
+            ordered.append(document_id)
+    rows = []
+    for document_id in ordered:
+        document = by_id.get(document_id) or {}
+        rows.append(
+            {
+                "id": document_id,
+                "kind": document.get("kind") or "",
+                "title": document.get("title") or "",
+                "cited": document_id in cited,
+                "text": document.get("text") or "",
+            }
+        )
+    return rows
+
+
+def _finish_turn(
+    interview: dict,
+    question: str,
+    *,
+    abstain: bool,
+    reason: str | None,
+    reply: str,
+    evidence_ids: list[str],
+    evidence: list[dict],
+    mcp_results: list[dict],
+    source: str | None,
+    synthesis: dict | None = None,
+) -> dict:
+    if synthesis is not None:
+        recorded = synthesis
+    elif source == "system":
+        recorded = blank_synthesis("system")
+    elif abstain:
+        recorded = blank_synthesis("none")
+    else:
+        recorded = blank_synthesis("indirect")
+    turn = {
+        "id": str(uuid.uuid4()),
+        "phase": interview["phase"],
+        "question": question,
+        "abstain": abstain,
+        "abstainReason": reason,
+        "reply": reply,
+        "evidenceIds": evidence_ids,
+        "retrievedIds": [item["id"] for item in evidence],
+        "mcp": [_public_mcp(item) for item in mcp_results],
+        "confidence": _confidence(evidence, evidence_ids, source),
+        "synthesis": recorded,
+        "createdAt": _now(),
+        "improved": False,
+    }
+    if source:
+        turn["source"] = source
+    return turn
+
+
+def _public_mcp(item: dict) -> dict:
+    return {
+        "database": item.get("database") or "",
+        "server": item.get("server") or "",
+        "tool": item.get("tool") or "",
+        "ok": bool(item.get("ok")),
+        "url": item.get("url") or "",
+        "error": item.get("error") or "",
+        "text": " ".join(str(item.get("text") or "").split())[:500],
+    }
+
+
+def _confidence(evidence: list[dict], evidence_ids: list[str], source: str | None) -> dict:
+    if source == "system":
+        return {"score": 0.35, "label": "low", "basis": "system dataset"}
+    cited = [item for item in evidence if item.get("id") in evidence_ids]
+    if not cited:
+        return {"score": 0.0, "label": "none", "basis": "uncited"}
+    databases = sorted({item.get("database") for item in cited if item.get("database")})
+    basis = "cited score"
+    if databases:
+        basis = "cited score from " + ", ".join(databases)
+    return {"score": 1.0, "label": "high", "basis": basis}
+
+
+_WEB_WALL = (
+    "skip to main content",
+    "sign in to view",
+    "sign in to continue",
+    "join now",
+    "cookie policy",
+    "open the app",
+)
+
+
+def _web_text_is_usable(text: str) -> bool:
+    lowered = text.lower()
+    walls = sum(phrase in lowered for phrase in _WEB_WALL)
+    return walls < 2
+
+
+def _external_evidence(session: dict, results: list[dict]) -> list[dict]:
+    start = len(session.get("externalEvidence") or []) + 1
+    documents = []
+    for result in results:
+        text = " ".join(str(result.get("text") or "").split())[:1200]
+        if not result.get("ok") or not text:
+            continue
+        if find_pii([{"id": "external", "title": "", "text": text}]):
+            result["ok"] = False
+            result["error"] = "pii"
+            result["text"] = ""
+            continue
+        if (result.get("database") or "web") == "web" and not _web_text_is_usable(text):
+            result["ok"] = False
+            result["error"] = "The page had no answer, only navigation or a sign-in wall."
+            result["text"] = ""
+            continue
+        database = result.get("database") or "web"
+        prefix = {"vector": "VEC", "graph": "GRAPH"}.get(database, "WEB")
+        documents.append(
+            {
+                "id": f"{prefix}-{start + len(documents)}",
+                "kind": "web" if prefix == "WEB" else "transcript",
+                "title": result.get("url") or result.get("tool") or database,
+                "text": text,
+                "cohortIds": [],
+                "score": 1.0,
+                "database": database,
+                "url": result.get("url") or "",
+            }
+        )
+    return documents
+
+
+def _system_datasets(session: dict, cohort_id: str) -> list[dict]:
+    rows = []
+    for document in session.get("documents") or []:
+        if document.get("kind") != "sales" and not document.get("datasetId"):
+            continue
+        if cohort_id not in (document.get("cohortIds") or []):
+            continue
+        rows.append(
+            {
+                "id": document.get("id"),
+                "datasetId": document.get("datasetId"),
+                "area": document.get("area") or "",
+                "title": document.get("title") or "",
+                "text": document.get("text") or "",
+            }
+        )
+    return rows
+
+
+def _system_disclosure(reply: str) -> str:
+    disclosure = "No evidence was found. This answer is from the system."
+    text = " ".join((reply or "").split())
+    lowered = text.lower()
+    if lowered.startswith("no evidence was found. this answer is from the system"):
+        return text
+    if lowered.startswith("no evidence was found"):
+        period = text.find(". ")
+        text = text[period + 2:].strip() if period != -1 else ""
+    body = text or "I am answering from the system datasets."
+    return f"{disclosure} {body}"
 
 
 def _fresh_guide(template: dict) -> dict:

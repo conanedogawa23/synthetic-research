@@ -207,5 +207,116 @@
       "title": "Tea-only hard out",
       "text": "Respondents who do not drink coffee are out of scope. Do not interview them as coffee buyers. A question that is only about tea, with no coffee, is outside the screener."
     }
+  ],
+  "datasets": [
+    {
+      "id": "DS-BLR-FILTER",
+      "label": "Filter coffee sales in Bengaluru office areas",
+      "category": "filter coffee",
+      "city": "Bengaluru",
+      "window": "last 18 months",
+      "rows": [
+        {
+          "id": "SL-WF",
+          "cohortIds": ["office-sippers"],
+          "area": "Whitefield",
+          "channel": "office canteen and gate darshini",
+          "cups": 18420,
+          "avgTicketInr": 30,
+          "title": "Filter coffee sales, Whitefield",
+          "text": "My office is in Whitefield, near ITPL and EPIP. Filter coffee is the weekday cup at the office canteen and at the darshini outside the gate. Over the last 18 months that counter moved 18420 cups at about 30 rupees. I still buy that filter on the way in. A can is for the cab, not a replacement for this cup."
+        },
+        {
+          "id": "SL-EC",
+          "cohortIds": ["office-sippers"],
+          "area": "Electronic City",
+          "channel": "campus canteen filter counter",
+          "cups": 22110,
+          "avgTicketInr": 25,
+          "title": "Filter coffee sales, Electronic City",
+          "text": "Electronic City Phase 1 still runs on filter at the campus canteen. The filter counter sold 22110 cups in the last 18 months at about 25 rupees. I take it between buildings. The canned coffee in the same canteen stays on the shelf because it does not taste like this filter."
+        },
+        {
+          "id": "SL-KRM",
+          "cohortIds": ["office-sippers", "cafe-switchers"],
+          "area": "Koramangala",
+          "channel": "office-adjacent filter counter",
+          "cups": 9630,
+          "avgTicketInr": 40,
+          "title": "Filter coffee sales, Koramangala",
+          "text": "In Koramangala 5th Block the filter counter next to the offices sold 9630 cups at about 40 rupees. I drink that before I sit down. A cafe cup nearby costs more and I still choose the filter when I am late. A can has not taken this sale."
+        },
+        {
+          "id": "SL-IND",
+          "cohortIds": ["office-sippers", "cafe-switchers"],
+          "area": "Indiranagar",
+          "channel": "filter before the office",
+          "cups": 8120,
+          "avgTicketInr": 45,
+          "title": "Filter coffee sales, Indiranagar",
+          "text": "On Indiranagar 100 Feet Road I buy filter before the office. That strip sold 8120 filter coffees in the last 18 months at about 45 rupees. It is a short bitter cup, closer to a cafe than to a sweet can. I do not swap it for a can I can open at the desk."
+        },
+        {
+          "id": "SL-MGR",
+          "cohortIds": ["office-sippers", "cafe-switchers"],
+          "area": "MG Road",
+          "channel": "office lobby filter",
+          "cups": 5400,
+          "avgTicketInr": 50,
+          "title": "Filter coffee sales, MG Road",
+          "text": "Around MG Road and UB City the office lobby filter sold 5400 cups at about 50 rupees. I drink it between meetings and I do not carry a can into that lobby. The price is already close to a small cafe cup, so a can has to taste like filter before I switch."
+        },
+        {
+          "id": "SL-MNY",
+          "cohortIds": ["office-sippers"],
+          "area": "Manyata Tech Park",
+          "channel": "tech park canteen",
+          "cups": 15780,
+          "avgTicketInr": 28,
+          "title": "Filter coffee sales, Manyata Tech Park",
+          "text": "At Manyata Tech Park in Hebbal the canteen filter is the default desk drink. The last 18 months show 15780 cups at about 28 rupees. People queue for filter, not for the canned coffee fridge. I want the can only when I am leaving the park for a client site."
+        },
+        {
+          "id": "SL-ORR",
+          "cohortIds": ["office-sippers"],
+          "area": "Marathahalli",
+          "channel": "pantry and roadside filter",
+          "cups": 13240,
+          "avgTicketInr": 30,
+          "title": "Filter coffee sales, Marathahalli",
+          "text": "On the Outer Ring Road at Marathahalli, pantry filter and the roadside filter together sold 13240 cups at about 30 rupees. I drink one before the standup. Cold coffee in a can is what I keep for the ride, after the filter, not instead of it."
+        },
+        {
+          "id": "SL-BLR",
+          "cohortIds": ["office-sippers"],
+          "area": "Bellandur",
+          "channel": "park canteen",
+          "cups": 16890,
+          "avgTicketInr": 32,
+          "title": "Filter coffee sales, Bellandur",
+          "text": "Bellandur offices around Embassy Tech Village and RMZ Ecoworld sold 16890 filter coffees at the park canteens, about 32 rupees a cup. The filter is ordinary and bitter. I will not pay cafe money for a can while this counter is on the way to my desk."
+        },
+        {
+          "id": "SL-BAG",
+          "cohortIds": ["office-sippers"],
+          "area": "Bagmane Tech Park",
+          "channel": "campus filter",
+          "cups": 12150,
+          "avgTicketInr": 27,
+          "title": "Filter coffee sales, Bagmane Tech Park",
+          "text": "Bagmane Tech Park at CV Raman Nagar logged 12150 filter coffees at about 27 rupees. I take it from the campus filter counter and drink it at the desk. It looks like a normal office cup. A pretty can would make me explain myself."
+        },
+        {
+          "id": "SL-HSR",
+          "cohortIds": ["office-sippers", "cafe-switchers"],
+          "area": "HSR Layout",
+          "channel": "office strip filter",
+          "cups": 7340,
+          "avgTicketInr": 35,
+          "title": "Filter coffee sales, HSR Layout",
+          "text": "On HSR Layout 27th Main the office-strip filter sold 7340 cups at about 35 rupees. I stop there when the cafe queue is long. The sale is still filter, not canned coffee. If a can tasted like that cup and stayed quiet on the desk, I would try it on a late morning."
+        }
+      ]
+    }
   ]
 }

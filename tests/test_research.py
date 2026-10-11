@@ -1,12 +1,18 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-from synthetic_research.deepinfra import parse_model_json
+from synthetic_research.corpus import campaign_sources, corpus_hash, validate_campaign
+from synthetic_research.deepinfra import RESPONDENT_SYSTEM, parse_model_json
 from synthetic_research.engine import ResearchEngine
 from synthetic_research.gates import ResearchError, quote_is_verbatim
+from synthetic_research.grounding import grounding_confidence, lock_citations
+from synthetic_research.knowledge_mcp import graph_query, graph_upsert, vector_query, vector_upsert
+from synthetic_research.mcp_client import ResearchMcp, first_public_https, public_https
 from synthetic_research.retrieve import build_index, retrieve
+from synthetic_research.s3_log import _merge
 from synthetic_research.store import SessionStore
 
 
@@ -100,9 +106,321 @@ class ResearchTests(unittest.TestCase):
         hits = retrieve(build_index(PACK["documents"]), "protein shake tastes like medicine", cohort_id="office-sippers")
         self.assertEqual(hits[0]["id"], "R-882")
 
+    def test_bengaluru_filter_sales_are_an_additional_dataset(self):
+        pack = json.loads((Path(__file__).resolve().parents[1] / "gold" / "cam-1842.json").read_text(encoding="utf-8"))
+        validate_campaign(pack)
+        self.assertEqual(pack["datasets"][0]["id"], "DS-BLR-FILTER")
+        areas = {row["area"] for row in pack["datasets"][0]["rows"]}
+        self.assertTrue(
+            {"Whitefield", "Electronic City", "Koramangala", "Indiranagar", "MG Road", "Manyata Tech Park"} <= areas
+        )
+        sources = campaign_sources(pack)
+        sales = [document for document in sources if document["kind"] == "sales"]
+        self.assertEqual(len(sales), 10)
+        self.assertEqual(len(sources), len(pack["documents"]) + len(sales))
+        bare = {**pack, "datasets": []}
+        self.assertNotEqual(corpus_hash(pack), corpus_hash(bare))
+        hits = retrieve(
+            build_index(sources),
+            "filter coffee sales in Whitefield Electronic City office canteen",
+            cohort_id="office-sippers",
+        )
+        self.assertIn(hits[0]["id"], {"SL-WF", "SL-EC"})
+        self.assertEqual(hits[0]["kind"], "sales")
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = ResearchEngine(SessionStore(Path(tmp)), FakeLlm())
+            session = engine.open(pack, actor="Meera")
+            granted = engine.grant(session["sessionId"], pack["grantId"], steward="Arjun")
+            self.assertEqual(granted["grant"]["documentCount"], len(sources))
+            cards = engine.compile_cards(session["sessionId"])
+            office = next(card for card in cards if card["cohortId"] == "office-sippers")
+            self.assertEqual(office["provenance"]["sales"], 10)
+
     def test_quote_must_be_verbatim(self):
         self.assertTrue(quote_is_verbatim("packed breakfast", ["A can looks like I packed breakfast."]))
         self.assertFalse(quote_is_verbatim("India loves cans", ["A can looks like I packed breakfast."]))
+
+    def test_missing_evidence_answers_from_the_system_datasets(self):
+        class RecordingLlm(FakeLlm):
+            def respondent(self, user: str) -> dict:
+                payload = json.loads(user)
+                if payload.get("source") == "system":
+                    self.datasets = payload["systemDatasets"]
+                    return {
+                        "abstain": True,
+                        "reply": "I would still want the bitter cup at the office counter.",
+                        "evidenceIds": ["SL-WF"],
+                    }
+                return super().respondent(user)
+
+        pack = json.loads(json.dumps(PACK))
+        pack["datasets"] = [
+            {
+                "id": "DS-BLR-FILTER",
+                "label": "Filter coffee sales in Bengaluru office areas",
+                "rows": [
+                    {
+                        "id": "SL-WF",
+                        "cohortIds": ["office-sippers"],
+                        "area": "Whitefield",
+                        "cups": 18420,
+                        "avgTicketInr": 30,
+                        "text": "Whitefield office canteens sold filter coffee by the cup.",
+                    }
+                ],
+            }
+        ]
+        llm = RecordingLlm()
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = ResearchEngine(SessionStore(Path(tmp)), llm)
+            session = engine.open(pack, actor="Meera")
+            engine.grant(session["sessionId"], "gold-1842", steward="Arjun")
+            engine.compile_cards(session["sessionId"])
+            engine.start_interview(session["sessionId"], "office-sippers")
+            tea = engine.ask(session["sessionId"], "office-sippers", "What tea do you brew in the morning?")
+            self.assertEqual(tea["abstainReason"], "out_of_screener_bounds")
+            turn = engine.ask(session["sessionId"], "office-sippers", "Which railway timetable do you keep?")
+        self.assertFalse(turn["abstain"])
+        self.assertEqual(turn["source"], "system")
+        self.assertEqual(turn["evidenceIds"], [])
+        self.assertIn("No evidence was found", turn["reply"])
+        self.assertIn("from the system", turn["reply"])
+        self.assertEqual(llm.datasets[0]["datasetId"], "DS-BLR-FILTER")
+        self.assertIn("Whitefield", llm.datasets[0]["text"])
+
+    def test_uncited_model_still_answers_from_the_system(self):
+        class AbstainThenSystem(FakeLlm):
+            def respondent(self, user: str) -> dict:
+                payload = json.loads(user)
+                if payload.get("source") == "system":
+                    return {"abstain": False, "reply": "I keep a can for the cab.", "evidenceIds": []}
+                return {"abstain": True, "reply": "", "evidenceIds": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = ResearchEngine(SessionStore(Path(tmp)), AbstainThenSystem())
+            session = engine.open(PACK, actor="Meera")
+            engine.grant(session["sessionId"], "gold-1842", steward="Arjun")
+            engine.compile_cards(session["sessionId"])
+            engine.start_interview(session["sessionId"], "office-sippers")
+            turn = engine.ask(session["sessionId"], "office-sippers", "Walk me through a weekday morning drink.")
+        self.assertFalse(turn["abstain"])
+        self.assertEqual(turn["source"], "system")
+        self.assertEqual(turn["evidenceIds"], [])
+        self.assertIn("No evidence was found", turn["reply"])
+        self.assertIn("from the system", turn["reply"])
+        self.assertEqual(turn["confidence"]["label"], "low")
+
+    def test_web_mcp_tool_call_is_cited_when_the_campaign_has_no_span(self):
+        class WebMcp:
+            def gather(self, question: str, cohort_id: str, **_extra: object) -> list[dict]:
+                del question, cohort_id, _extra
+                return [
+                    {
+                        "database": "web",
+                        "server": "fetch",
+                        "tool": "fetch",
+                        "ok": True,
+                        "text": "The office filter counter is the weekday cup. A cafe cup costs more.",
+                        "url": "https://example.com/filter-coffee",
+                        "error": "",
+                    },
+                    {
+                        "database": "vector",
+                        "server": "qdrant",
+                        "tool": "qdrant-find",
+                        "ok": False,
+                        "text": "",
+                        "url": "",
+                        "error": "MCP_VECTOR is off.",
+                    },
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = ResearchEngine(SessionStore(Path(tmp)), FakeLlm(), mcp=WebMcp())
+            session = engine.open(PACK, actor="Meera")
+            engine.grant(session["sessionId"], "gold-1842", steward="Arjun")
+            engine.compile_cards(session["sessionId"])
+            engine.start_interview(session["sessionId"], "office-sippers")
+            turn = engine.ask(session["sessionId"], "office-sippers", "Which railway timetable do you keep?")
+            chip = engine.open_evidence(session["sessionId"], "WEB-1")
+        self.assertFalse(turn["abstain"])
+        self.assertEqual(turn["evidenceIds"], ["WEB-1"])
+        self.assertEqual(turn["confidence"]["basis"], "cited score from web")
+        self.assertEqual(turn["mcp"][0]["tool"], "fetch")
+        self.assertFalse(turn["mcp"][1]["ok"])
+        self.assertIn("cafe cup costs more", chip["text"])
+
+    def test_mcp_catalog_stays_quiet_until_a_database_is_configured(self):
+        self.assertFalse(public_https("http://example.com/page"))
+        self.assertFalse(public_https("https://127.0.0.1/secret"))
+        self.assertEqual(first_public_https("see https://example.com/filter."), "https://example.com/filter")
+        keys = (
+            "MCP_WEB",
+            "MCP_VECTOR",
+            "MCP_GRAPH",
+            "BRAVE_API_KEY",
+            "MCP_FETCH_URL",
+            "QDRANT_URL",
+            "QDRANT_LOCAL_PATH",
+            "NEO4J_MCP_PASSWORD",
+            "KNOWLEDGE_MCP_DIR",
+        )
+        saved = {key: os.environ.get(key) for key in keys}
+        try:
+            for key in keys:
+                os.environ.pop(key, None)
+            results = ResearchMcp().gather("filter coffee in Bengaluru", "office-sippers")
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual([item["database"] for item in results], ["web", "vector", "graph"])
+        self.assertTrue(all(not item["ok"] for item in results))
+        self.assertEqual(results[0]["tool"], "search")
+
+    def test_web_search_uses_duckduckgo_without_an_api_key(self):
+        keys = (
+            "MCP_WEB",
+            "BRAVE_API_KEY",
+            "MCP_FETCH_URL",
+            "DDG_REGION",
+            "MCP_VECTOR",
+            "MCP_GRAPH",
+            "KNOWLEDGE_MCP_DIR",
+            "QDRANT_URL",
+            "QDRANT_LOCAL_PATH",
+            "NEO4J_MCP_PASSWORD",
+        )
+        saved = {key: os.environ.get(key) for key in keys}
+        os.environ["MCP_WEB"] = "true"
+        os.environ["DDG_REGION"] = "in-en"
+        for key in keys:
+            if key not in {"MCP_WEB", "DDG_REGION"}:
+                os.environ.pop(key, None)
+        calls = []
+
+        def fake_call(server, tool, arguments):
+            calls.append((server.name, server.args, tool, arguments, server.env))
+            if tool == "search":
+                return "Filter coffee\nhttps://example.com/filter-coffee\nA cafe cup costs more."
+            return "The office filter counter is the weekday cup."
+
+        try:
+            client = ResearchMcp()
+            client.call_tool = fake_call
+            results = client.gather("filter coffee in Bengaluru", "office-sippers")
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual(calls[0][0], "duckduckgo")
+        self.assertIn("duckduckgo-mcp-server[browser]", calls[0][1])
+        self.assertEqual(calls[0][2], "search")
+        self.assertNotIn("BRAVE_API_KEY", calls[0][4])
+        self.assertEqual(calls[1][2], "fetch_content")
+        self.assertEqual(calls[1][3]["url"], "https://example.com/filter-coffee")
+        self.assertTrue(results[0]["ok"])
+        self.assertEqual(results[0]["tool"], "search")
+        self.assertTrue(results[1]["ok"])
+
+    def test_session_knowledge_mcp_stores_and_answers(self):
+        try:
+            import mcp  # noqa: F401
+        except ImportError:
+            self.skipTest("mcp is installed in .venv")
+
+        keys = (
+            "KNOWLEDGE_MCP_DIR",
+            "MCP_VECTOR",
+            "MCP_GRAPH",
+            "QDRANT_URL",
+            "QDRANT_LOCAL_PATH",
+            "NEO4J_MCP_PASSWORD",
+        )
+        saved = {key: os.environ.get(key) for key in keys}
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["KNOWLEDGE_MCP_DIR"] = tmp
+            try:
+                session_id = "a9cbd64f-f3d8-45c9-8141-c8fde0c84e4d"
+                vector_upsert(
+                    session_id,
+                    json.dumps(
+                        [
+                            {
+                                "id": "UP-001-c1",
+                                "text": "Profitable growth protects margins and sales productivity.",
+                                "vector": [1.0, 0.0],
+                            }
+                        ]
+                    ),
+                )
+                found = vector_query(session_id, "What protects margins?", json.dumps([1.0, 0.0]), 2)
+                self.assertIn("UP-001-c1", found)
+                graph_upsert(
+                    session_id,
+                    json.dumps(
+                        {
+                            "nodes": [],
+                            "edges": [{"from": "Frontline", "relation": "supports", "to": "field teams"}],
+                        }
+                    ),
+                )
+                linked = graph_query(session_id, "Who supports the field teams?")
+                self.assertIn("Frontline supports field teams", linked)
+                client = ResearchMcp()
+                os.environ["MCP_VECTOR"] = "true"
+                os.environ["MCP_GRAPH"] = "true"
+                os.environ.pop("QDRANT_URL", None)
+                os.environ.pop("QDRANT_LOCAL_PATH", None)
+                os.environ.pop("NEO4J_MCP_PASSWORD", None)
+                stored = client.index_knowledge(
+                    session_id,
+                    [{"id": "UP-001-c2", "text": "Merchandising productivity is the weekly check.", "vector": [0.0, 1.0]}],
+                    {"nodes": [], "edges": [{"from": "Merchandising", "relation": "is", "to": "weekly"}]},
+                )
+                self.assertTrue(all(row["ok"] for row in stored), stored)
+                asked = client.gather("What is the weekly check?", "respondents", session_id=session_id, query_vector=[0.0, 1.0])
+            finally:
+                for key, value in saved.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+        by_database = {row["database"]: row for row in asked}
+        self.assertTrue(by_database["vector"]["ok"], by_database["vector"])
+        self.assertIn("UP-001-c2", by_database["vector"]["text"])
+        self.assertEqual(by_database["vector"]["tool"], "vector_query")
+        self.assertTrue(by_database["graph"]["ok"], by_database["graph"])
+        self.assertEqual(by_database["graph"]["tool"], "graph_query")
+        self.assertFalse(by_database["web"]["ok"])
+
+    def test_one_session_log_collects_each_question(self):
+        first = _merge({}, {"sessionId": "s1", "campaignId": "c1", "turnId": "t1", "question": "First"})
+        second = _merge(first, {"sessionId": "s1", "campaignId": "c1", "turnId": "t2", "question": "Second"})
+        replaced = _merge(second, {"sessionId": "s1", "campaignId": "c1", "turnId": "t1", "question": "First, improved"})
+        self.assertEqual([item["question"] for item in replaced["questions"]], ["First, improved", "Second"])
+        self.assertEqual(replaced["sessionId"], "s1")
+
+    def test_a_reply_cannot_keep_a_document_it_was_not_given(self):
+        reply, kept, removed = lock_citations(
+            "Field teams spend time on admin [UP-009-c5]. A blog says otherwise [WEB-4].",
+            ["WEB-4", "GRAPH-7", "UP-002-c1"],
+            {"UP-002-c1", "WEB-4", "GRAPH-7"},
+        )
+        self.assertEqual(removed, ["UP-009-c5"])
+        self.assertNotIn("UP-009-c5", reply)
+        self.assertNotIn("GRAPH-7", kept)
+        self.assertEqual(kept, ["WEB-4", "UP-002-c1"])
+        self.assertEqual(grounding_confidence(supported=False, removed=removed, used_web=False)["label"], "medium")
+        self.assertEqual(grounding_confidence(supported=True, removed=[], used_web=False)["score"], 1.0)
+
+    def test_respondent_treats_a_cafe_contrast_as_an_answer(self):
+        self.assertIn("contrast inside a span is an answer", RESPONDENT_SYSTEM)
+        self.assertIn("contrast inside a span is an answer", RESPONDENT_SYSTEM)
 
     def test_json_fence_parses(self):
         parsed = parse_model_json('```json\n{"ok": true}\n```')
@@ -219,6 +537,14 @@ class ResearchTests(unittest.TestCase):
             query_vector=[0.99, 0.01],
         )
         self.assertEqual(hits[0]["id"], "T-06")
+
+    def test_follow_up_runs_once_after_a_short_cited_reply(self):
+        from synthetic_research.engine import should_follow_up
+
+        cited = {"abstain": False, "reply": "I want it bitter enough to count as coffee."}
+        self.assertTrue(should_follow_up(cited, 8))
+        self.assertFalse(should_follow_up({"abstain": True, "reply": ""}, 8))
+        self.assertFalse(should_follow_up(cited, 0))
 
 
 if __name__ == "__main__":

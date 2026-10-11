@@ -9,6 +9,35 @@ EMAIL = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 PHONE = re.compile(r"(?:\+\d{1,3}[\s-]?)?(?:\(?\d{3}\)?[\s-]?)\d{3}[\s-]?\d{4}")
 
 
+def campaign_sources(campaign: dict) -> list[dict]:
+    sources = [dict(document) for document in campaign.get("documents") or []]
+    sources.extend(materialize_datasets(campaign))
+    return sources
+
+
+def materialize_datasets(campaign: dict) -> list[dict]:
+    rows = []
+    for dataset in campaign.get("datasets") or []:
+        dataset_id = dataset.get("id") or ""
+        for row in dataset.get("rows") or []:
+            area = row.get("area") or ""
+            rows.append(
+                {
+                    "id": row.get("id"),
+                    "kind": "sales",
+                    "cohortIds": list(row.get("cohortIds") or []),
+                    "title": row.get("title") or f"Filter coffee sales, {area}",
+                    "text": row.get("text") or "",
+                    "datasetId": dataset_id,
+                    "area": area,
+                    "channel": row.get("channel") or "",
+                    "cups": row.get("cups"),
+                    "avgTicketInr": row.get("avgTicketInr"),
+                }
+            )
+    return rows
+
+
 def corpus_hash(campaign: dict) -> str:
     rows = [
         {
@@ -17,7 +46,7 @@ def corpus_hash(campaign: dict) -> str:
             "cohortIds": sorted(document.get("cohortIds") or []),
             "text": document.get("text") or "",
         }
-        for document in campaign.get("documents") or []
+        for document in campaign_sources(campaign)
     ]
     rows.sort(key=lambda row: row["id"])
     payload = json.dumps(rows, separators=(",", ":"), ensure_ascii=False)
@@ -75,7 +104,7 @@ def validate_campaign(campaign: dict) -> None:
         if not document_id or document_id in seen:
             errors.append("Each gold document needs a unique id.")
         seen.add(document_id)
-        if document.get("kind") not in SOURCE_KINDS:
+        if document.get("kind") not in SOURCE_KINDS - {"sales"}:
             errors.append(f"{document_id} has a kind outside transcript, review, and screener.")
         if not document.get("text"):
             errors.append(f"{document_id} has no text.")
@@ -88,5 +117,37 @@ def validate_campaign(campaign: dict) -> None:
         )
         if not covered:
             errors.append(f"Cohort {cohort_id} has no screener membership count.")
+    _validate_datasets(campaign, cohort_ids, seen, errors)
     if errors:
         raise ResearchError("PACK_INVALID", " ".join(errors))
+
+
+def _validate_datasets(campaign: dict, cohort_ids: set, seen: set, errors: list[str]) -> None:
+    dataset_ids = set()
+    for dataset in campaign.get("datasets") or []:
+        dataset_id = dataset.get("id")
+        if not dataset_id or dataset_id in dataset_ids:
+            errors.append("Each additional dataset needs a unique id.")
+        dataset_ids.add(dataset_id)
+        if not dataset.get("label"):
+            errors.append(f"Dataset {dataset_id} needs a label.")
+        rows = dataset.get("rows") or []
+        if not rows:
+            errors.append(f"Dataset {dataset_id} has no rows.")
+        for row in rows:
+            row_id = row.get("id")
+            if not row_id or row_id in seen:
+                errors.append("Each sales row needs a unique id.")
+            seen.add(row_id)
+            if not row.get("area"):
+                errors.append(f"{row_id} has no office area.")
+            if not row.get("text"):
+                errors.append(f"{row_id} has no text.")
+            if row.get("cups") is None or row.get("avgTicketInr") is None:
+                errors.append(f"{row_id} needs cups and avgTicketInr.")
+            tied = row.get("cohortIds") or []
+            if not tied:
+                errors.append(f"{row_id} is not tied to a cohort.")
+            unknown = [cohort_id for cohort_id in tied if cohort_id not in cohort_ids]
+            if unknown:
+                errors.append(f"{row_id} cites an unknown cohort.")
