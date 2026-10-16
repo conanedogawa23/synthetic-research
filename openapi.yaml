@@ -1,0 +1,1277 @@
+openapi: 3.0.3
+info:
+  title: Synthetic research API
+  version: 1.0.0
+  description: |
+    HTTP API behind the Campaign OS screens on the ec2-ui branch.
+    The live client is campaign-os-ui/lib/backend/research.ts.
+
+    A refusal is still HTTP 200. The body is `{ "ok": false, "code", "message" }`.
+    Success is `{ "ok": true, "data" }`.
+    GET /sessions/{sessionId}.json is the exception: it returns the stored question log, or HTTP 404.
+servers:
+  - url: https://research.ashavate.com/api
+    description: Public host. Nginx strips the /api prefix before the service.
+  - url: http://127.0.0.1:8787
+    description: The service on the research host.
+tags:
+  - name: campaigns
+  - name: personas
+  - name: sessions
+  - name: interviews
+  - name: evidence
+components:
+  parameters:
+    Actor:
+      name: X-Actor
+      in: header
+      required: false
+      schema:
+        type: string
+        default: Meera
+      description: Name stored on uploads. Missing values become Meera.
+    CampaignId:
+      name: campaignId
+      in: path
+      required: true
+      schema:
+        type: string
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema:
+        type: string
+    InterviewId:
+      name: interviewId
+      in: path
+      required: true
+      schema:
+        type: string
+    SpanId:
+      name: spanId
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    Refusal:
+      type: object
+      required: [ok, code, message]
+      properties:
+        ok:
+          type: boolean
+          enum: [false]
+        code:
+          type: string
+          example: NOT_FOUND
+        message:
+          type: string
+    Phase:
+      type: string
+      enum: [rapport, unprompted, deep_dive, prompted]
+    GuideQuestion:
+      type: object
+      required: [id, phase, text]
+      properties:
+        id:
+          type: string
+        phase:
+          $ref: "#/components/schemas/Phase"
+        text:
+          type: string
+    Campaign:
+      type: object
+      required: [id, name, market, category, kitVersion, persona, guide]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+          description: First sentence of kit.purpose, cut at 120 characters.
+        market:
+          type: string
+        category:
+          type: string
+        kitVersion:
+          type: string
+        persona:
+          type: string
+          description: Respondent prompt. Empty until a persona is saved.
+        guide:
+          type: array
+          items:
+            $ref: "#/components/schemas/GuideQuestion"
+    McpCall:
+      type: object
+      required: [database, tool, ok, error, url, text]
+      properties:
+        database:
+          type: string
+        tool:
+          type: string
+        ok:
+          type: boolean
+        error:
+          type: string
+        url:
+          type: string
+        text:
+          type: string
+    Knowledge:
+      type: object
+      required: [ready, vectorCount, retrieval, vectorStore, graphNodes, graphEdges, edges, warning, mcp]
+      properties:
+        ready:
+          type: boolean
+        vectorCount:
+          type: integer
+          minimum: 0
+        retrieval:
+          type: string
+        vectorStore:
+          type: string
+        graphNodes:
+          type: integer
+          minimum: 0
+        graphEdges:
+          type: integer
+          minimum: 0
+        edges:
+          type: array
+          items:
+            type: object
+            required: [from, relation, to]
+            properties:
+              from:
+                type: string
+              relation:
+                type: string
+              to:
+                type: string
+        warning:
+          type: string
+          nullable: true
+        mcp:
+          type: array
+          items:
+            $ref: "#/components/schemas/McpCall"
+    Session:
+      type: object
+      required: [id, campaignId, stage, phase, openedAt, closedAt, grantId, evidenceReady, knowledge]
+      properties:
+        id:
+          type: string
+        campaignId:
+          type: string
+        stage:
+          type: string
+          enum: [intake, insight, closed]
+          description: brand, creative, and production are accepted by the screen and are not returned.
+        phase:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/Phase"
+        openedAt:
+          type: string
+          format: date-time
+        closedAt:
+          type: string
+          format: date-time
+          nullable: true
+        grantId:
+          type: string
+          nullable: true
+        evidenceReady:
+          type: boolean
+        knowledge:
+          $ref: "#/components/schemas/Knowledge"
+    SourceFile:
+      type: object
+      required: [id, filename, sizeBytes, contentType, uploadedAt, uploadedBy, status, statusLabel]
+      properties:
+        id:
+          type: string
+        filename:
+          type: string
+        sizeBytes:
+          type: integer
+          minimum: 0
+        contentType:
+          type: string
+        uploadedAt:
+          type: string
+          format: date-time
+        uploadedBy:
+          type: string
+        status:
+          type: string
+          enum: [received, ready]
+        statusLabel:
+          type: string
+    Cohort:
+      type: object
+      required: [id, label, members]
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        members:
+          type: integer
+          minimum: 0
+    RespondentCard:
+      type: object
+      required: [id, cohortId, label]
+      properties:
+        id:
+          type: string
+        cohortId:
+          type: string
+        label:
+          type: string
+    Chip:
+      type: object
+      required: [spanId, kind]
+      properties:
+        spanId:
+          type: string
+        kind:
+          type: string
+          enum: [transcript, review, screener, sales, web]
+    Reply:
+      oneOf:
+        - type: object
+          required: [kind, text, chips]
+          properties:
+            kind:
+              type: string
+              enum: [cited]
+            text:
+              type: string
+            chips:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/Chip"
+        - type: object
+          required: [kind, reason]
+          properties:
+            kind:
+              type: string
+              enum: [abstain]
+            reason:
+              type: string
+        - type: object
+          required: [kind, text, datasets]
+          properties:
+            kind:
+              type: string
+              enum: [system]
+            text:
+              type: string
+            datasets:
+              type: array
+              items:
+                type: string
+    Synthesis:
+      type: object
+      required: [mode, directDocumentId, conflicts]
+      properties:
+        mode:
+          type: string
+          enum: [direct, conflict, indirect, system, none]
+        directDocumentId:
+          type: string
+          nullable: true
+        documentIds:
+          type: array
+          items:
+            type: string
+        conflicts:
+          type: array
+          items:
+            type: object
+            required: [point, label, sides]
+            properties:
+              point:
+                type: string
+              label:
+                type: string
+              sides:
+                type: array
+                items:
+                  type: object
+                  required: [stance, label, documentIds]
+                  properties:
+                    stance:
+                      type: string
+                    label:
+                      type: string
+                    documentIds:
+                      type: array
+                      items:
+                        type: string
+                    excerpt:
+                      type: string
+    Turn:
+      type: object
+      required: [id, phase, question, reply, createdAt, followUp, synthesis]
+      properties:
+        id:
+          type: string
+        phase:
+          $ref: "#/components/schemas/Phase"
+        question:
+          type: string
+        reply:
+          $ref: "#/components/schemas/Reply"
+        createdAt:
+          type: string
+          format: date-time
+        followUp:
+          type: string
+          nullable: true
+        synthesis:
+          $ref: "#/components/schemas/Synthesis"
+        confidence:
+          type: object
+          required: [score, label, basis]
+          properties:
+            score:
+              type: number
+            label:
+              type: string
+            basis:
+              type: string
+        mcp:
+          type: array
+          items:
+            $ref: "#/components/schemas/McpCall"
+    Interview:
+      type: object
+      required: [id, sessionId, cardId, status, phase, turnsUsed, turnCap, turns]
+      properties:
+        id:
+          type: string
+        sessionId:
+          type: string
+        cardId:
+          type: string
+        status:
+          type: string
+          enum: [open, ended]
+        phase:
+          $ref: "#/components/schemas/Phase"
+        turnsUsed:
+          type: integer
+          minimum: 0
+        turnCap:
+          type: integer
+          minimum: 1
+        turns:
+          type: array
+          items:
+            $ref: "#/components/schemas/Turn"
+    InsightPack:
+      type: object
+      required: [status, badge, disclosureNote, oversightName, citedTurnCount, cohorts, skips]
+      properties:
+        status:
+          type: string
+        badge:
+          type: string
+        disclosureNote:
+          type: string
+        oversightName:
+          type: string
+          nullable: true
+        citedTurnCount:
+          type: integer
+          minimum: 0
+        cohorts:
+          type: array
+          items:
+            type: object
+            required: [cohortId, promise, tension, themes]
+            properties:
+              cohortId:
+                type: string
+              promise:
+                type: string
+              tension:
+                type: string
+              themes:
+                type: array
+                items:
+                  type: object
+                  required: [theme, quote, evidenceIds]
+                  properties:
+                    theme:
+                      type: string
+                    quote:
+                      type: string
+                    evidenceIds:
+                      type: array
+                      items:
+                        type: string
+        skips:
+          type: array
+          items:
+            type: object
+            required: [cohortId, reason]
+            properties:
+              cohortId:
+                type: string
+              reason:
+                type: string
+    Evidence:
+      type: object
+      required: [spanId, kind, text, source, market]
+      properties:
+        spanId:
+          type: string
+        kind:
+          type: string
+          enum: [transcript, review, screener, sales, web]
+        text:
+          type: string
+        source:
+          type: string
+        market:
+          type: string
+    PersonaTemplate:
+      type: object
+      required: [id, label, description, prompt]
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        description:
+          type: string
+        prompt:
+          type: string
+    PersonaUpdate:
+      type: object
+      required: [persona, openSessions, warning]
+      properties:
+        persona:
+          type: string
+        openSessions:
+          type: integer
+          minimum: 0
+        warning:
+          type: string
+          nullable: true
+    PersonaImpact:
+      type: object
+      required: [openSessions, totalSessions, warning]
+      properties:
+        openSessions:
+          type: integer
+          minimum: 0
+        totalSessions:
+          type: integer
+          minimum: 0
+        warning:
+          type: string
+          nullable: true
+  responses:
+    Refusal:
+      description: The call was refused. The HTTP status is still 200.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Refusal"
+paths:
+  /health:
+    get:
+      tags: [campaigns]
+      summary: Service health
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, data]
+                properties:
+                  ok:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    type: object
+                    required: [status]
+                    properties:
+                      status:
+                        type: string
+                        enum: [ok]
+  /personas/templates:
+    get:
+      tags: [personas]
+      summary: Persona starting points
+      description: Choosing a template does not save it.
+      responses:
+        "200":
+          description: Template list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, data]
+                properties:
+                  ok:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PersonaTemplate"
+  /campaigns:
+    get:
+      tags: [campaigns]
+      summary: List campaigns
+      responses:
+        "200":
+          description: Campaigns, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/Campaign"
+                  - $ref: "#/components/schemas/Refusal"
+    post:
+      tags: [campaigns]
+      summary: Create a campaign
+      parameters:
+        - $ref: "#/components/parameters/Actor"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, market, category]
+              properties:
+                name:
+                  type: string
+                market:
+                  type: string
+                category:
+                  type: string
+      responses:
+        "200":
+          description: Created campaign, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Campaign"
+                  - $ref: "#/components/schemas/Refusal"
+  /campaigns/{campaignId}:
+    get:
+      tags: [campaigns]
+      summary: Read one campaign
+      parameters:
+        - $ref: "#/components/parameters/CampaignId"
+      responses:
+        "200":
+          description: Campaign, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Campaign"
+                  - $ref: "#/components/schemas/Refusal"
+  /campaigns/{campaignId}/kit:
+    patch:
+      tags: [personas]
+      summary: Save the campaign persona
+      description: Copies the persona onto every open session. Stored answers are left as they are. An empty persona is refused with PACK_INVALID.
+      parameters:
+        - $ref: "#/components/parameters/CampaignId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [persona]
+              properties:
+                persona:
+                  type: string
+                  minLength: 1
+      responses:
+        "200":
+          description: Saved persona, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/PersonaUpdate"
+                  - $ref: "#/components/schemas/Refusal"
+  /campaigns/{campaignId}/impact:
+    get:
+      tags: [personas]
+      summary: Count sessions a persona change would touch
+      parameters:
+        - $ref: "#/components/parameters/CampaignId"
+      responses:
+        "200":
+          description: Impact, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/PersonaImpact"
+                  - $ref: "#/components/schemas/Refusal"
+  /campaigns/{campaignId}/sessions:
+    get:
+      tags: [sessions]
+      summary: List sessions for a campaign
+      parameters:
+        - $ref: "#/components/parameters/CampaignId"
+      responses:
+        "200":
+          description: Sessions, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/Session"
+                  - $ref: "#/components/schemas/Refusal"
+    post:
+      tags: [sessions]
+      summary: Open a session
+      parameters:
+        - $ref: "#/components/parameters/CampaignId"
+        - $ref: "#/components/parameters/Actor"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: New session, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Session"
+                  - $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}:
+    get:
+      tags: [sessions]
+      summary: Read a session
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Session, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Session"
+                  - $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}.json:
+    get:
+      tags: [sessions]
+      summary: Read the stored question log
+      description: This route does not use the ok/data envelope. A missing log is HTTP 404 with a refusal body.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: The question log object stored for this session
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "404":
+          description: No question log yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}/knowledge:
+    get:
+      tags: [sessions]
+      summary: List uploaded knowledge files
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Files, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/SourceFile"
+                  - $ref: "#/components/schemas/Refusal"
+    post:
+      tags: [sessions]
+      summary: Upload one knowledge file
+      description: The file is base64 JSON, at most 50 MB decoded. The service derives the content type from the filename.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - $ref: "#/components/parameters/Actor"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename, contentBase64]
+              properties:
+                filename:
+                  type: string
+                contentBase64:
+                  type: string
+                  format: byte
+                contentType:
+                  type: string
+                  description: Sent by the screen and ignored. The filename decides the type.
+      responses:
+        "200":
+          description: Received file, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/SourceFile"
+                  - $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}/knowledge/prepare:
+    post:
+      tags: [sessions]
+      summary: Build vectors and the graph for uploaded files
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - $ref: "#/components/parameters/Actor"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                steward:
+                  type: string
+      responses:
+        "200":
+          description: Updated session, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Session"
+                  - $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}/grant:
+    post:
+      tags: [sessions]
+      summary: Grant the session evidence
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [steward]
+              properties:
+                steward:
+                  type: string
+      responses:
+        "200":
+          description: Granted session, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Session"
+                  - $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}/cohorts:
+    get:
+      tags: [sessions]
+      summary: List cohorts
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Cohorts, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/Cohort"
+                  - $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}/respondents:
+    get:
+      tags: [sessions]
+      summary: Compile respondent cards
+      description: Calling this compiles the cards. The first card is what the screen uses to start an interview.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Cards, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/RespondentCard"
+                  - $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}/interviews:
+    get:
+      tags: [interviews]
+      summary: List interviews in a session
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Interviews, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/Interview"
+                  - $ref: "#/components/schemas/Refusal"
+    post:
+      tags: [interviews]
+      summary: Start an interview
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cardId]
+              properties:
+                cardId:
+                  type: string
+      responses:
+        "200":
+          description: Interview, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Interview"
+                  - $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}/skip:
+    post:
+      tags: [sessions]
+      summary: Skip a cohort
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cohortId, reason]
+              properties:
+                cohortId:
+                  type: string
+                reason:
+                  type: string
+      responses:
+        "200":
+          description: Updated session, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Session"
+                  - $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}/pack:
+    get:
+      tags: [sessions]
+      summary: Read the insight pack
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Pack, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/InsightPack"
+                  - $ref: "#/components/schemas/Refusal"
+    post:
+      tags: [sessions]
+      summary: Draft the insight pack
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Draft pack, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/InsightPack"
+                  - $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}/approve:
+    post:
+      tags: [sessions]
+      summary: Approve the insight pack
+      description: This approves the pack. It does not approve the question list.
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [oversightName]
+              properties:
+                oversightName:
+                  type: string
+      responses:
+        "200":
+          description: Approved pack, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/InsightPack"
+                  - $ref: "#/components/schemas/Refusal"
+  /sessions/{sessionId}/evidence/{spanId}:
+    get:
+      tags: [evidence]
+      summary: Read one cited span
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - $ref: "#/components/parameters/SpanId"
+      responses:
+        "200":
+          description: Evidence, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Evidence"
+                  - $ref: "#/components/schemas/Refusal"
+  /interviews/{interviewId}:
+    get:
+      tags: [interviews]
+      summary: Read an interview
+      description: The same call exists at /sessions/{sessionId}/interviews/{interviewId}.
+      parameters:
+        - $ref: "#/components/parameters/InterviewId"
+      responses:
+        "200":
+          description: Interview, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Interview"
+                  - $ref: "#/components/schemas/Refusal"
+  /interviews/{interviewId}/questions:
+    post:
+      tags: [interviews]
+      summary: Ask a question
+      description: The same call exists at /sessions/{sessionId}/interviews/{interviewId}/questions.
+      parameters:
+        - $ref: "#/components/parameters/InterviewId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question:
+                  type: string
+      responses:
+        "200":
+          description: Turn, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Turn"
+                  - $ref: "#/components/schemas/Refusal"
+  /interviews/{interviewId}/phase:
+    post:
+      tags: [interviews]
+      summary: Advance the interview phase
+      description: The same call exists at /sessions/{sessionId}/interviews/{interviewId}/phase.
+      parameters:
+        - $ref: "#/components/parameters/InterviewId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Interview, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Interview"
+                  - $ref: "#/components/schemas/Refusal"
+  /interviews/{interviewId}/end:
+    post:
+      tags: [interviews]
+      summary: End an interview
+      description: The same call exists at /sessions/{sessionId}/interviews/{interviewId}/end.
+      parameters:
+        - $ref: "#/components/parameters/InterviewId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Ended interview, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Interview"
+                  - $ref: "#/components/schemas/Refusal"
+  /interviews/{interviewId}/improve:
+    post:
+      tags: [interviews]
+      summary: Rewrite the latest reply
+      description: The same call exists at /sessions/{sessionId}/interviews/{interviewId}/improve. A missing instruction becomes "Tighten this reply."
+      parameters:
+        - $ref: "#/components/parameters/InterviewId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                instruction:
+                  type: string
+      responses:
+        "200":
+          description: Replacement turn, or a refusal
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, data]
+                    properties:
+                      ok:
+                        type: boolean
+                        enum: [true]
+                      data:
+                        $ref: "#/components/schemas/Turn"
+                  - $ref: "#/components/schemas/Refusal"
