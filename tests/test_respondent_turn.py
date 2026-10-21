@@ -348,6 +348,7 @@ class RespondentTurnTests(unittest.TestCase):
                 }
             ],
             allowed={"T-06", "R-640"},
+            retrieval_ids={"T-06", "R-640"},
         )
         self.assertIn("flatmate is asleep", reply)
         self.assertIn("T-06", ids)
@@ -374,6 +375,7 @@ class RespondentTurnTests(unittest.TestCase):
                 {"id": "R-640", "kind": "review", "score": 0.7, "text": "I drink it in the cab and I do not talk about it."},
             ],
             allowed={"T-06", "R-640"},
+            retrieval_ids={"T-06", "R-640"},
         )
         self.assertIn("flatmate is asleep", reply)
         self.assertIn("T-06", ids)

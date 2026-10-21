@@ -41,7 +41,7 @@ _INTERPERSONAL = re.compile(
     re.IGNORECASE,
 )
 _PRESENCE = re.compile(
-    r"\bflatmate\b|\basleep\b|\balone\b|\bmother\b|\bfather\b|\bpartner\b|\bhousehold\b|\bflat\b",
+    r"\bflatmate\b|\basleep\b|\balone\b|\bmother\b|\bfather\b|\bpartner\b|\bhousehold\b",
     re.IGNORECASE,
 )
 
@@ -338,6 +338,7 @@ def restore_cited_specifics(
     question: str = "",
     corpus_evidence: list[dict] | None = None,
     allowed: set[str] | None = None,
+    retrieval_ids: set[str] | None = None,
 ) -> tuple[str, list[str]]:
     """Keep the model's answer. Restore missing figures the question calls for, not whole files."""
     by_id = _merge_evidence_lookup(model_evidence, corpus_evidence)
@@ -381,6 +382,26 @@ def restore_cited_specifics(
         reply_norm = f"{reply_norm} {norm}".strip()
         present |= _figure_keys(sentence)
 
+    if _span_word_count(text) < THIN_WORD_LIMIT and interpersonal_question(question):
+        for document_id in evidence_ids:
+            item = by_id.get(document_id) or {}
+            body = str(item.get("text") or "")
+            if _is_long_span(body):
+                continue
+            for sentence in _clauses(body):
+                if not _mentions_presence(sentence) or _covered(reply_norm, sentence):
+                    continue
+                norm = _normalize(sentence)
+                if not norm or norm in reply_norm:
+                    continue
+                text = f"{text} {sentence}".strip()
+                reply_norm = f"{reply_norm} {norm}".strip()
+                if document_id not in kept_ids:
+                    kept_ids.append(document_id)
+                break
+            if _mentions_presence(text):
+                break
+
     if _span_word_count(text) < THIN_WORD_LIMIT:
         for document_id in evidence_ids:
             item = by_id.get(document_id) or {}
@@ -405,7 +426,7 @@ def restore_cited_specifics(
     text = " ".join(text.split())
 
     if interpersonal_question(question) and not _mentions_presence(text):
-        allowed_ids = allowed if allowed is not None else set(by_id)
+        allowed_ids = set(retrieval_ids or set()) | set(allowed or set()) | set(by_id)
         candidates: list[tuple[int, str, str]] = []
         corpus = sorted(
             (corpus_evidence or list(by_id.values())),
