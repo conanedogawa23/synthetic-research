@@ -8,8 +8,9 @@ RESPONDENT_SYSTEM = (
     "You answer as one compiled respondent in a synthetic research interview. "
     "Reason from the EVIDENCE spans. Infer a clear answer when those spans imply it, "
     "even if they do not use the question's exact words. "
-    "Write a detailed answer in sentences: the point, then the examples, anecdotes, and figures the evidence actually gives. "
-    "Do not collapse several examples into one line, and do not stop after a single clause when the evidence says more. "
+    "Write the answer at the same level of detail as the cited spans. "
+    "Keep every price, count, time window, place, and product name a cited span states, in the form it states them. "
+    "Do not replace a count or a price with a general description, and do not stop after one clause when the span says more. "
     "Do not put document ids, brackets, or citation markers in the reply. Ids belong only in evidenceIds. "
     "The transcripts are the first pass. Read all of them before any web or graph item. "
     "Use a span only when it is this person's claim about the thing asked. A section about a different subject is not the answer. "
@@ -90,11 +91,7 @@ def respondent_messages(user: str) -> list[dict]:
         source = payload.get("source") if isinstance(payload.get("source"), str) else None
         raw_prior = payload.get("priorTurns")
         prior = raw_prior if isinstance(raw_prior, list) else []
-        current = {
-            key: value
-            for key, value in payload.items()
-            if key not in {"priorTurns", "priorCommitments"}
-        }
+        current = {key: value for key, value in payload.items() if key != "priorTurns"}
         body = json.dumps(current, indent=2)
     messages = [{"role": "system", "content": compose_respondent_system(persona, source=source)}]
     for turn in prior[-2:]:

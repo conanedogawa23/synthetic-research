@@ -8,7 +8,27 @@ with a document excerpt.
 
 from __future__ import annotations
 
+import re
+
 from synthetic_research.retrieve import tokenize
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_DIGIT = re.compile(r"\d[\d,]*(?:\.\d+)?")
+_NUMBER_WORDS = re.compile(
+    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|eighteen|"
+    r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)"
+    r"(?:[-\s](?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|"
+    r"forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand))*\b",
+    re.IGNORECASE,
+)
+_UNIT = re.compile(r"\b(?:rupees?|cups?|months?|days?|weeks?|percent|pack)\b", re.IGNORECASE)
+_SCREENER = re.compile(
+    r"out of scope|hard out|member count|gold slice|tea-only|do not interview|"
+    r"metro office drinkers|ready-to-drink coffee in the last|incidence is higher",
+    re.IGNORECASE,
+)
+
+THIN_WORD_LIMIT = 45
 
 CHAT_TURN_LIMIT = 2
 LEDGER_LIMIT = 12
@@ -169,3 +189,94 @@ def enforce_required_statements(
             if document_id in allowed and document_id not in kept:
                 kept.append(document_id)
     return text, kept
+
+
+def _sentences(text: str) -> list[str]:
+    return [part.strip() for part in _SENTENCE_SPLIT.split((text or "").strip()) if part.strip()]
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _figure_keys(text: str) -> set[str]:
+    """Prices, counts, and spelled quantities. A bare single digit is not a figure."""
+    keys: set[str] = set()
+    for match in _DIGIT.finditer(text or ""):
+        raw = match.group(0).replace(",", "")
+        if len(raw.replace(".", "")) >= 2:
+            keys.add(raw)
+            continue
+        window = text[max(0, match.start() - 16) : match.end() + 16]
+        if _UNIT.search(window):
+            keys.add(raw)
+    for match in _NUMBER_WORDS.finditer(text or ""):
+        keys.add(_normalize(match.group(0)))
+    return keys
+
+
+def _covered(reply_norm: str, sentence: str) -> bool:
+    norm = _normalize(sentence)
+    if norm and norm in reply_norm:
+        return True
+    tokens = [token for token in tokenize(sentence) if len(token) > 2]
+    if not tokens:
+        return False
+    reply_tokens = set(tokenize(reply_norm))
+    hits = sum(1 for token in tokens if token in reply_tokens)
+    return hits / len(tokens) >= 0.75
+
+
+def restore_cited_specifics(reply: str, evidence_ids: list[str], evidence: list[dict]) -> str:
+    """Keep the model's answer. Put back cited prices, counts, and a thin span's other sentences."""
+    by_id: dict[str, dict] = {}
+    for item in evidence:
+        document_id = str(item.get("id") or "")
+        if document_id and document_id not in by_id:
+            by_id[document_id] = item
+    cited_text = " ".join(str(by_id.get(document_id, {}).get("text") or "") for document_id in evidence_ids)
+    cited_norm = _normalize(cited_text)
+    kept: list[str] = []
+    for sentence in _sentences(reply):
+        if _SCREENER.search(sentence) and _normalize(sentence) not in cited_norm:
+            continue
+        kept.append(sentence)
+    text = " ".join(kept).strip()
+    reply_norm = _normalize(text)
+    present = _figure_keys(text)
+    additions: list[str] = []
+
+    def add(sentence: str) -> None:
+        nonlocal reply_norm, present
+        norm = _normalize(sentence)
+        if not norm or norm in reply_norm:
+            return
+        additions.append(sentence)
+        reply_norm = f"{reply_norm} {norm}".strip()
+        present |= _figure_keys(sentence)
+
+    for document_id in evidence_ids:
+        item = by_id.get(document_id) or {}
+        if str(item.get("kind") or "") == "screener":
+            continue
+        for sentence in _sentences(str(item.get("text") or "")):
+            if _SCREENER.search(sentence):
+                continue
+            missing = _figure_keys(sentence) - present
+            if missing:
+                add(sentence)
+    text = " ".join([text, *additions]).strip()
+    if len(text.split()) >= THIN_WORD_LIMIT:
+        return " ".join(text.split())
+    for document_id in evidence_ids:
+        item = by_id.get(document_id) or {}
+        if str(item.get("kind") or "") == "screener":
+            continue
+        for sentence in _sentences(str(item.get("text") or "")):
+            if _SCREENER.search(sentence) or _covered(reply_norm, sentence):
+                continue
+            add(sentence)
+            text = " ".join([text, sentence]).strip()
+            if len(text.split()) >= THIN_WORD_LIMIT:
+                return " ".join(text.split())
+    return " ".join(text.split())

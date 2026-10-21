@@ -279,7 +279,10 @@ class SynthesisEngineTests(unittest.TestCase):
             engine, session_id = self._engine(tmp, Citing(), pack)
             kept = engine.ask(session_id, "office-sippers", "Who brews the coffee?")
         self.assertEqual(kept["synthesis"]["mode"], "indirect")
-        self.assertEqual(kept["reply"], "It depends on who brews it.")
+        self.assertIn("It depends on who brews it.", kept["reply"])
+        self.assertIn("The morning drink is mine.", kept["reply"])
+        self.assertIn("My mother makes coffee before I leave.", kept["reply"])
+        self.assertIn("At the office canteen I still look for filter.", kept["reply"])
         self.assertEqual(kept["synthesis"]["conflicts"][0]["point"], "brewer")
         self.assertTrue({"T-06", "T-44", "T-31"} <= set(kept["evidenceIds"]))
 

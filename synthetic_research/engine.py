@@ -23,6 +23,7 @@ from synthetic_research.respondent_turn import (
     prior_commitments,
     prior_turns,
     required_statements,
+    restore_cited_specifics,
 )
 from synthetic_research.retrieve import SOURCE_KINDS, tokenize
 from synthetic_research.s3_log import log_question
@@ -948,6 +949,7 @@ class ResearchEngine:
         reply = str(raw.get("reply") or "").strip()
         reply, evidence_ids, removed = lock_citations(reply, evidence_ids, allowed)
         reply, evidence_ids = enforce_required_statements(reply, evidence_ids, statements, allowed)
+        reply = restore_cited_specifics(reply, evidence_ids, model_evidence)
         leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
         pii = find_pii([{"id": "reply", "title": "", "text": reply}])
         if leaked or pii:

@@ -12,6 +12,7 @@ from synthetic_research.respondent_turn import (
     prior_commitments,
     prior_turns,
     required_statements,
+    restore_cited_specifics,
 )
 from synthetic_research.store import SessionStore
 
@@ -222,7 +223,8 @@ class RespondentTurnTests(unittest.TestCase):
         self.assertEqual(messages[2], {"role": "assistant", "content": "A can at the desk."})
         current = json.loads(messages[-1]["content"])
         self.assertNotIn("priorTurns", current)
-        self.assertNotIn("priorCommitments", current)
+        self.assertEqual(len(current["priorCommitments"]), 1)
+        self.assertEqual(current["priorCommitments"][0]["evidenceIds"], ["T-14"])
         self.assertEqual(current["question"], "And after that?")
 
     def test_engine_sends_prior_commitments_and_bounded_evidence(self):
@@ -241,6 +243,67 @@ class RespondentTurnTests(unittest.TestCase):
         self.assertIn("priorCommitments", payload)
         self.assertGreaterEqual(len(payload["priorCommitments"]), 1)
         self.assertLessEqual(len(payload["evidence"]), 9)
+
+    def test_a_paraphrase_gets_the_cited_count_and_price_back(self):
+        reply = restore_cited_specifics(
+            "Filter coffee is what I drink before I sit down at the office.",
+            ["SL-EC"],
+            [
+                {
+                    "id": "SL-EC",
+                    "kind": "sales",
+                    "text": (
+                        "Electronic City Phase 1 still runs on filter at the campus canteen. "
+                        "The filter counter sold 22110 cups in the last 18 months at about 25 rupees. "
+                        "I take it between buildings."
+                    ),
+                }
+            ],
+        )
+        self.assertIn("before I sit down", reply)
+        self.assertIn("22110 cups", reply)
+        self.assertIn("25 rupees", reply)
+        self.assertEqual(reply.count("22110"), 1)
+
+    def test_a_figure_already_in_the_reply_is_not_pasted_again(self):
+        sentence = "The filter counter sold 22110 cups in the last 18 months at about 25 rupees."
+        reply = restore_cited_specifics(
+            f"I still buy filter. {sentence}",
+            ["SL-EC"],
+            [{"id": "SL-EC", "kind": "sales", "text": sentence}],
+        )
+        self.assertEqual(reply.count("22110"), 1)
+
+    def test_a_one_line_answer_keeps_the_rest_of_the_cited_span(self):
+        reply = restore_cited_specifics(
+            "I tried a sweet can.",
+            ["T-06"],
+            [
+                {
+                    "id": "T-06",
+                    "kind": "transcript",
+                    "text": (
+                        "The morning drink is mine. My flatmate is asleep. "
+                        "Out of home, cold coffee is for the back seat before a meeting in Gurgaon. "
+                        "I tried a sweet can that tasted like a milkshake and dropped it after one week."
+                    ),
+                }
+            ],
+        )
+        self.assertIn("sweet can", reply)
+        self.assertIn("flatmate is asleep", reply)
+        self.assertIn("Gurgaon", reply)
+
+    def test_screener_boilerplate_is_removed_when_the_cited_span_does_not_say_it(self):
+        reply = restore_cited_specifics(
+            "The morning drink is mine. Respondents who do not drink coffee are out of scope. "
+            "Metro office drinkers age 25 to 34 who bought ready-to-drink coffee in the last 90 days.",
+            ["T-06"],
+            [{"id": "T-06", "kind": "transcript", "text": "The morning drink is mine. My flatmate is asleep."}],
+        )
+        self.assertIn("morning drink is mine", reply)
+        self.assertNotIn("out of scope", reply)
+        self.assertNotIn("Metro office drinkers", reply)
 
 
 if __name__ == "__main__":
