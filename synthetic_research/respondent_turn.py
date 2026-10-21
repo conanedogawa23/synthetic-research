@@ -339,6 +339,7 @@ def restore_cited_specifics(
     corpus_evidence: list[dict] | None = None,
     allowed: set[str] | None = None,
     retrieval_ids: set[str] | None = None,
+    prior_document_ids: set[str] | None = None,
 ) -> tuple[str, list[str]]:
     """Keep the model's answer. Restore missing figures the question calls for, not whole files."""
     by_id = _merge_evidence_lookup(model_evidence, corpus_evidence)
@@ -448,7 +449,10 @@ def restore_cited_specifics(
                 overlap = _question_overlap(question, sentence)
                 if overlap < 1 and not _mentions_presence(sentence):
                     continue
-                candidates.append((overlap + (2 if item.get("kind") == "transcript" else 0), sentence, document_id))
+                boost = 2 if item.get("kind") == "transcript" else 0
+                if prior_document_ids and document_id in prior_document_ids:
+                    boost += 4
+                candidates.append((overlap + boost, sentence, document_id))
         candidates.sort(key=lambda row: (-row[0], row[1]))
         if candidates:
             _score, sentence, document_id = candidates[0]

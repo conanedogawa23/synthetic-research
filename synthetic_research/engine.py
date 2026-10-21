@@ -964,15 +964,28 @@ class ResearchEngine:
                 synthesis=blank_synthesis("none"),
             )
         evidence_ids = [item for item in cited_ids(plan, evidence_ids) if item in allowed]
-        retrieval_ids = {str(item["id"]) for item in evidence if item.get("id")}
+        prior_document_ids: set[str] = set()
+        for prior_turn in interview.get("turns") or []:
+            for document_id in prior_turn.get("evidenceIds") or []:
+                if document_id:
+                    prior_document_ids.add(str(document_id))
+        indexed = {doc["id"]: doc for doc in self._index(session)["documents"] if doc.get("id")}
+        corpus_for_restore = list(evidence)
+        seen_corpus = {str(item.get("id") or "") for item in corpus_for_restore}
+        for document_id in prior_document_ids:
+            if document_id in indexed and document_id not in seen_corpus:
+                corpus_for_restore.append(indexed[document_id])
+                seen_corpus.add(document_id)
+        retrieval_ids = {str(item["id"]) for item in evidence if item.get("id")} | prior_document_ids
         reply, evidence_ids = restore_cited_specifics(
             reply,
             evidence_ids,
             model_evidence,
             question=question,
-            corpus_evidence=evidence,
+            corpus_evidence=corpus_for_restore,
             allowed=allowed,
             retrieval_ids=retrieval_ids,
+            prior_document_ids=prior_document_ids,
         )
         evidence_ids = [item for item in evidence_ids if item in retrieval_ids]
         leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
