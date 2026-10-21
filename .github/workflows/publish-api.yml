@@ -1,0 +1,13 @@
+name: Publish API
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish:
+    runs-on: [self-hosted, winimy-sydney]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the API on the Sydney host
+        run: bash scripts/publish-api.sh

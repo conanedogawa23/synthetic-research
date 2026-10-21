@@ -8,8 +8,8 @@ Process for a question over a cohort group:
    states the answer is a reference, not an answer.
 3. When transcripts and reviews disagree on spend, who brews, or whether a
    routine is allowed, keep every side. Do not collapse the group into one
-   preference. Those sides are already stated, so they are quoted. Only the
-   indirect case is inferred by the model.
+   preference. A direct sentence or a conflict side is a required statement
+   for the respondent. An indirect reference has no required statement.
 """
 
 from __future__ import annotations

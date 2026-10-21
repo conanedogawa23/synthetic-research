@@ -2,8 +2,9 @@ import argparse
 import shlex
 from pathlib import Path
 
+from synthetic_research.chat import ChatClient
 from synthetic_research.config import assert_inference_config, read_config
-from synthetic_research.deepinfra import DeepInfraClient
+from synthetic_research.embeddings import EmbedClient
 from synthetic_research.engine import ResearchEngine
 from synthetic_research.gates import ResearchError
 from synthetic_research.mcp_client import ResearchMcp, enable_session_mcp
@@ -257,8 +258,8 @@ def main(argv: list[str] | None = None) -> None:
     config = read_config(ROOT)
     enable_session_mcp(ROOT)
     assert_inference_config(config)
-    client = DeepInfraClient(config)
-    engine = ResearchEngine(SessionStore(ROOT / "data"), client, embedder=client, mcp=ResearchMcp())
+    chat = ChatClient(config)
+    engine = ResearchEngine(SessionStore(ROOT / "data"), chat, embedder=EmbedClient(config), mcp=ResearchMcp())
     pack = load_campaign(Path(args.pack))
     SessionCli(engine, pack).run()
 

@@ -174,6 +174,42 @@ class ResearchApiTests(unittest.TestCase):
         self.assertGreater(knowledge["graphEdges"], 0)
         self.assertTrue(prepared["data"]["evidenceReady"])
 
+    def test_persona_routes_keep_the_campaign_name_and_update_open_sessions(self) -> None:
+        templates = self.api.handle("GET", "/personas/templates", None, "Meera")
+        self.assertTrue(templates["ok"], templates)
+        self.assertGreaterEqual(len(templates["data"]), 1)
+
+        before = self.api.handle("GET", "/campaigns/CAM-1842", None, "Meera")
+        self.assertTrue(before["ok"], before)
+        self.assertEqual(before["data"]["id"], "CAM-1842")
+        self.assertIn("name", before["data"])
+        self.assertEqual(before["data"]["persona"], "")
+
+        opened = self.api.handle("POST", "/campaigns/CAM-1842/sessions", {}, "Meera")
+        self.assertTrue(opened["ok"], opened)
+        purpose_before = self.api.engine.store.read(opened["data"]["id"])["kit"]["purpose"]
+        impact = self.api.handle("GET", "/campaigns/CAM-1842/impact", None, "Meera")
+        self.assertTrue(impact["ok"], impact)
+        self.assertGreaterEqual(impact["data"]["openSessions"], 1)
+
+        empty = self.api.handle("PATCH", "/campaigns/CAM-1842/kit", {}, "Meera")
+        self.assertFalse(empty["ok"])
+        self.assertEqual(empty["code"], "PACK_INVALID")
+
+        persona = "VP of Sales at a large FMCG company. Speak from field execution, and ask before accepting a new system."
+        saved = self.api.handle("PATCH", "/campaigns/CAM-1842/kit", {"persona": persona}, "Meera")
+        self.assertTrue(saved["ok"], saved)
+        self.assertEqual(saved["data"]["persona"], persona)
+        self.assertGreaterEqual(saved["data"]["openSessions"], 1)
+
+        after = self.api.handle("GET", "/campaigns/CAM-1842", None, "Meera")
+        self.assertEqual(after["data"]["name"], before["data"]["name"])
+        self.assertEqual(after["data"]["persona"], persona)
+
+        session = self.api.engine.store.read(opened["data"]["id"])
+        self.assertEqual(session["kit"]["persona"], persona)
+        self.assertEqual(session["kit"]["purpose"], purpose_before)
+
 
 if __name__ == "__main__":
     unittest.main()

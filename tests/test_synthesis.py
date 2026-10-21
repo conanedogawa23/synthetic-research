@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from synthetic_research.corpus import campaign_sources
-from synthetic_research.deepinfra import PACK_SYSTEM, RESPONDENT_SYSTEM
+from synthetic_research.prompts import PACK_SYSTEM, RESPONDENT_SYSTEM
 from synthetic_research.engine import ResearchEngine
 from synthetic_research.store import SessionStore
 from synthetic_research.synthesis import format_synthesis, plan_synthesis
@@ -217,23 +217,34 @@ class SynthesisEngineTests(unittest.TestCase):
         engine.start_interview(session["sessionId"], "office-sippers")
         return engine, session["sessionId"]
 
-    def test_direct_answer_does_not_call_the_model(self):
-        class Boom(FakeLlm):
+    def test_direct_answer_is_one_persona_call(self):
+        class Spoke(FakeLlm):
             def respondent(self, user: str) -> dict:
-                raise AssertionError(user)
+                self.calls = getattr(self, "calls", 0) + 1
+                payload = json.loads(user)
+                self.required = payload.get("requiredStatements")
+                return {
+                    "abstain": False,
+                    "reply": "I start with whatever is already on the desk.",
+                    "evidenceIds": [],
+                }
 
         pack = json.loads(json.dumps(PACK))
         pack["documents"] = [
             _doc("T-14", "Weekday morning is Bru at the flat, then a cab."),
             pack["documents"][-1],
         ]
+        llm = Spoke()
         with tempfile.TemporaryDirectory() as tmp:
-            engine, session_id = self._engine(tmp, Boom(), pack)
+            engine, session_id = self._engine(tmp, llm, pack)
             turn = engine.ask(session_id, "office-sippers", "What is the weekday morning drink?")
+        self.assertEqual(llm.calls, 1)
+        self.assertTrue(llm.required)
         self.assertFalse(turn["abstain"])
         self.assertEqual(turn["synthesis"]["mode"], "direct")
         self.assertEqual(turn["synthesis"]["directDocumentId"], "T-14")
         self.assertEqual(turn["evidenceIds"], ["T-14"])
+        self.assertIn("already on the desk", turn["reply"])
         self.assertIn("Weekday morning", turn["reply"])
         self.assertIn("direct answer in T-14", turn["confidence"]["basis"])
 
@@ -275,10 +286,29 @@ class SynthesisEngineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             engine, session_id = self._engine(tmp, OneSide(), pack)
             restored = engine.ask(session_id, "office-sippers", "Who brews the coffee?")
-        self.assertEqual(restored["synthesis"]["mode"], "conflict")
-        self.assertIn("morning drink is mine", restored["reply"])
-        self.assertIn("My mother", restored["reply"])
-        self.assertIn("canteen", restored["reply"])
+        self.assertEqual(restored["synthesis"]["mode"], "indirect")
+        self.assertEqual(restored["reply"], "The morning drink is mine.")
+        self.assertIn("T-06", restored["evidenceIds"])
+
+    def test_the_next_question_receives_the_previous_reply(self):
+        class Recording(FakeLlm):
+            def respondent(self, user: str) -> dict:
+                payload = json.loads(user)
+                self.prior = payload.get("priorTurns") or []
+                return super().respondent(user)
+
+        pack = json.loads(json.dumps(PACK))
+        pack["documents"] = [
+            _doc("T-14", "Weekday morning is Bru at the flat, then a cab."),
+            pack["documents"][-1],
+        ]
+        llm = Recording()
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, session_id = self._engine(tmp, llm, pack)
+            engine.ask(session_id, "office-sippers", "What is the weekday morning drink?")
+            engine.ask(session_id, "office-sippers", "What does the cab change?")
+        self.assertEqual(llm.prior[-1]["question"], "What is the weekday morning drink?")
+        self.assertIn("Weekday morning", llm.prior[-1]["reply"])
 
     def test_indirect_reference_is_inferred_by_the_model(self):
         class Recording(FakeLlm):
@@ -326,15 +356,16 @@ class SynthesisEngineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             engine, session_id = self._engine(tmp, llm, pack)
             turn = engine.ask(session_id, "office-sippers", "Would you pay cafe money for a can?")
-            self.assertEqual(llm.calls, 0)
+            self.assertEqual(llm.calls, 1)
             improved = engine.improve(session_id, "office-sippers", "Make this one preference.")
         self.assertEqual(turn["synthesis"]["mode"], "conflict")
         self.assertEqual(turn["synthesis"]["conflicts"][0]["point"], "spend")
+        self.assertIn("I would pay cafe money and I am fine with the price.", turn["reply"])
         self.assertIn("will not pay", turn["reply"])
         self.assertIn("would pay", turn["reply"])
         self.assertEqual(improved["reply"], turn["reply"])
         self.assertFalse(improved["improved"])
-        self.assertEqual(llm.calls, 1)
+        self.assertEqual(llm.calls, 2)
         self.assertEqual(turn["confidence"]["basis"], "direct answers in conflict")
 
     def test_gold_spend_question_names_the_direct_document_and_both_sides(self):
@@ -353,15 +384,23 @@ class SynthesisEngineTests(unittest.TestCase):
         winner = next(document for document in group if document["id"] == plan["directDocumentId"])
         self.assertIn(plan["reply"].split(". ")[0], winner["text"])
 
-        class Boom(FakeLlm):
+        class Spoke(FakeLlm):
             def respondent(self, user: str) -> dict:
-                raise AssertionError("spend conflict is stated in the transcripts")
+                self.calls = getattr(self, "calls", 0) + 1
+                return {
+                    "abstain": False,
+                    "reply": "The price is the whole argument for me.",
+                    "evidenceIds": [],
+                }
 
+        llm = Spoke()
         with tempfile.TemporaryDirectory() as tmp:
-            engine, session_id = self._engine(tmp, Boom(), pack)
+            engine, session_id = self._engine(tmp, llm, pack)
             turn = engine.ask(session_id, "office-sippers", "What would make you pay cafe money for a can?")
+        self.assertEqual(llm.calls, 1)
         self.assertEqual(turn["synthesis"]["directDocumentId"], plan["directDocumentId"])
         self.assertEqual(turn["evidenceIds"][0], plan["directDocumentId"])
+        self.assertIn("The price is the whole argument for me.", turn["reply"])
         self.assertFalse(turn["abstain"])
 
     def test_a_web_page_is_not_pasted_when_it_only_matches_the_wording(self):
@@ -393,6 +432,7 @@ class SynthesisEngineTests(unittest.TestCase):
 
     def test_prompt_keeps_indirect_inference_and_conflict_sides_for_the_model(self):
         self.assertIn("When task is indirect", RESPONDENT_SYSTEM)
+        self.assertIn("When requiredStatements is not empty", RESPONDENT_SYSTEM)
         self.assertIn("Do not merge a recorded conflict into one preference", RESPONDENT_SYSTEM)
         self.assertIn("If a cited turn lists conflicts", PACK_SYSTEM)
 

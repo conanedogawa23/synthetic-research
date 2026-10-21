@@ -12,15 +12,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from synthetic_research.chat import ChatClient
 from synthetic_research.config import assert_inference_config, read_config
 from synthetic_research.corpus import validate_campaign
-from synthetic_research.deepinfra import DeepInfraClient
+from synthetic_research.embeddings import EmbedClient
 from synthetic_research.engine import ResearchEngine
 from synthetic_research.gates import ResearchError
+from synthetic_research.grounding import visible_evidence_ids
 from synthetic_research.mcp_client import ResearchMcp, enable_session_mcp
 from synthetic_research.s3_log import read_session_log
 from synthetic_research.store import SessionStore
-from synthetic_research.synthesis import cited_ids, plan_synthesis, public_synthesis
+from synthetic_research.synthesis import plan_synthesis, public_synthesis
 
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_KINDS = {"transcript", "review", "screener", "sales", "web"}
@@ -54,6 +56,27 @@ def _stamp(value: str | None) -> str:
     return text
 
 
+PERSONA_TEMPLATES = [
+    {
+        "id": "skeptic",
+        "label": "The Skeptic",
+        "description": "Demands rigorous proof, dislikes buzzwords, and is highly critical of theoretical gains.",
+        "prompt": "A high-level executive who is deeply skeptical. They prioritize hard evidence, specific figures, and historical failures over promised future gains."
+    },
+    {
+        "id": "visionary",
+        "label": "The Visionary",
+        "description": "Focuses on long-term strategic shifts and industry-wide transformation.",
+        "prompt": "A forward-thinking leader focused on the 5-year horizon. They are interested in how this change transforms the entire category, not just marginal gains."
+    },
+    {
+        "id": "operator",
+        "label": "The Operator",
+        "description": "Concerned with day-to-day friction, field execution, and 'boots on the ground' reality.",
+        "prompt": "A pragmatic leader focused on execution. They care about the friction of daily operations and how a solution actually works in the field."
+    }
+]
+
 class ResearchApi:
     def __init__(self, engine: ResearchEngine, packs: dict[str, dict], campaign_dir: Path | None = None):
         self.engine = engine
@@ -73,6 +96,8 @@ class ResearchApi:
     def _route(self, method: str, parts: list[str], body: dict, actor: str):
         if parts == ["health"] and method == "GET":
             return {"status": "ok"}
+        if parts == ["personas", "templates"] and method == "GET":
+            return PERSONA_TEMPLATES
         if parts == ["campaigns"] and method == "GET":
             self._refresh_saved()
             return [_campaign(pack) for pack in self.packs.values()]
@@ -80,6 +105,10 @@ class ResearchApi:
             return self._create_campaign(body)
         if len(parts) == 2 and parts[0] == "campaigns" and method == "GET":
             return _campaign(self._pack(parts[1]))
+        if len(parts) == 3 and parts[0] == "campaigns" and parts[2] == "kit" and method == "PATCH":
+            return self._update_persona(parts[1], body)
+        if len(parts) == 3 and parts[0] == "campaigns" and parts[2] == "impact" and method == "GET":
+            return self._persona_impact(parts[1])
         if len(parts) == 3 and parts[0] == "campaigns" and parts[2] == "sessions" and method == "GET":
             self._pack(parts[1])
             return [_session(row) for row in self._sessions() if row.get("campaignId") == parts[1]]
@@ -220,6 +249,58 @@ class ResearchApi:
         session = self._session_for_interview(interview_id)
         return self._nested_interview(method, session["sessionId"], interview_id, parts[2:], body)
 
+    def _update_persona(self, campaign_id: str, body: dict) -> dict:
+        persona = str(body.get("persona") or "").strip()
+        if not persona:
+            raise ResearchError("PACK_INVALID", "A persona needs text.")
+        pack = self._pack(campaign_id)
+        pack.setdefault("kit", {})["persona"] = persona
+        self.packs[campaign_id] = pack
+        self._persist_pack(campaign_id, pack)
+        open_sessions = self._apply_persona_to_open_sessions(campaign_id, persona)
+        warning = None
+        if open_sessions:
+            warning = (
+                f"The next question in {open_sessions} open session"
+                f"{'' if open_sessions == 1 else 's'} will use this persona. "
+                "Answers already stored stay as they are."
+            )
+        return {"persona": persona, "openSessions": open_sessions, "warning": warning}
+
+    def _persona_impact(self, campaign_id: str) -> dict:
+        self._pack(campaign_id)
+        sessions = [row for row in self._sessions() if row.get("campaignId") == campaign_id]
+        open_sessions = sum(1 for row in sessions if row.get("status") == "open")
+        warning = None
+        if open_sessions:
+            warning = (
+                f"Saving a new persona will apply to the next question in {open_sessions} open session"
+                f"{'' if open_sessions == 1 else 's'}. Answers already stored stay as they are."
+            )
+        return {
+            "openSessions": open_sessions,
+            "totalSessions": len(sessions),
+            "warning": warning,
+        }
+
+    def _persist_pack(self, campaign_id: str, pack: dict) -> None:
+        if self.campaign_dir is None:
+            return
+        self.campaign_dir.mkdir(parents=True, exist_ok=True)
+        path = self.campaign_dir / f"{campaign_id}.json"
+        path.write_text(json.dumps(pack, indent=2) + "\n", encoding="utf-8")
+
+    def _apply_persona_to_open_sessions(self, campaign_id: str, persona: str) -> int:
+        updated = 0
+        for row in self._sessions():
+            if row.get("campaignId") != campaign_id or row.get("status") != "open":
+                continue
+            kit = row.setdefault("kit", {})
+            kit["persona"] = persona
+            self.engine.store.write(row)
+            updated += 1
+        return updated
+
     def _refresh_saved(self) -> None:
         if self.campaign_dir is None:
             return
@@ -337,6 +418,7 @@ def _campaign(pack: dict) -> dict:
         "market": (pack.get("marketPack") or {}).get("market") or pack.get("market") or "",
         "category": pack.get("category") or "",
         "kitVersion": (pack.get("kit") or {}).get("version") or "",
+        "persona": str((pack.get("kit") or {}).get("persona") or ""),
         "guide": [
             {"id": main.get("id") or f"m{index}", "phase": main.get("phase"), "text": main.get("text")}
             for index, main in enumerate((pack.get("guide") or {}).get("mains") or [], start=1)
@@ -517,7 +599,10 @@ def _synthesis_for(session: dict, turn: dict) -> dict:
         retrieved_ids=set(turn.get("retrievedIds") or []),
     )
     view = _synthesis_view(public_synthesis(plan))
-    view["documentIds"] = cited_ids(plan, list(turn.get("evidenceIds") or []))
+    shown = visible_evidence_ids(str(turn.get("reply") or ""), list(turn.get("evidenceIds") or []))
+    view["documentIds"] = shown
+    if view.get("directDocumentId") not in shown:
+        view["directDocumentId"] = shown[0] if shown else None
     return view
 
 
@@ -564,8 +649,8 @@ def _reply(turn: dict, kinds: dict[str, str], document_ids: list[str]) -> dict:
         }
     chips = []
     seen = set()
-    for evidence_id in [*document_ids, *(turn.get("evidenceIds") or [])]:
-        if not evidence_id or evidence_id in seen:
+    for evidence_id in visible_evidence_ids(str(turn.get("reply") or ""), list(turn.get("evidenceIds") or [])):
+        if evidence_id in seen:
             continue
         seen.add(evidence_id)
         kind = kinds.get(evidence_id, "transcript")
@@ -622,7 +707,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._dispatch(None)
 
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._read_json_body()
+
     def do_POST(self) -> None:  # noqa: N802
+        self._read_json_body()
+
+    def _read_json_body(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
         try:
@@ -666,11 +757,11 @@ def main() -> None:
     config = read_config(ROOT)
     enable_session_mcp(ROOT)
     assert_inference_config(config)
-    client = DeepInfraClient(config)
+    chat = ChatClient(config)
     engine = ResearchEngine(
         SessionStore(ROOT / "data"),
-        client,
-        embedder=client,
+        chat,
+        embedder=EmbedClient(config),
         mcp=ResearchMcp(),
     )
     port = int(os.environ.get("PORT") or os.environ.get("RESEARCH_PORT") or 8787)

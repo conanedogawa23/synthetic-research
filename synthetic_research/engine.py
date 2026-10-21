@@ -15,19 +15,13 @@ from synthetic_research.gates import (
     public_evidence,
     quote_is_verbatim,
 )
-from synthetic_research.grounding import grounding_confidence, lock_citations
+from synthetic_research.grounding import grounding_confidence, lock_citations, passage_status
 from synthetic_research.knowledge import build_graph, chunk_text, read_upload
+from synthetic_research.respondent_turn import enforce_required_statements, prior_turns, required_statements
 from synthetic_research.retrieve import SOURCE_KINDS, tokenize
 from synthetic_research.s3_log import log_question
 from synthetic_research.search import retrieve_evidence
-from synthetic_research.synthesis import (
-    blank_synthesis,
-    cited_ids,
-    fallback_plan,
-    model_respects_plan,
-    plan_synthesis,
-    public_synthesis,
-)
+from synthetic_research.synthesis import blank_synthesis, cited_ids, plan_synthesis, public_synthesis
 
 TURN_CAP = 10
 
@@ -166,6 +160,7 @@ class ResearchEngine:
                 "locked": True,
                 "brandAlias": campaign["kit"]["brandAlias"],
                 "purpose": campaign["kit"]["purpose"],
+                "persona": str(campaign["kit"].get("persona") or "").strip(),
             },
             "marketPack": campaign["marketPack"],
             "cohortRules": [dict(rule) for rule in campaign["cohorts"]],
@@ -477,7 +472,7 @@ class ResearchEngine:
                     "phase": interview.get("phase"),
                     "question": str(question),
                     "error": str(error)[:500],
-                    "model": os.environ.get("DEEPINFRA_FAST_MODEL") or "",
+                    "model": os.environ.get("CHAT_MODEL") or os.environ.get("DEEPINFRA_FAST_MODEL") or "",
                 }
             )
             raise
@@ -560,7 +555,7 @@ class ResearchEngine:
                     "mcp": list(turn.get("mcp") or []),
                     "source": turn.get("source"),
                     "improved": bool(turn.get("improved")),
-                    "model": os.environ.get("DEEPINFRA_FAST_MODEL") or "",
+                    "model": os.environ.get("CHAT_MODEL") or os.environ.get("DEEPINFRA_FAST_MODEL") or "",
                 }
             )
         except Exception as error:  # noqa: BLE001
@@ -855,7 +850,7 @@ class ResearchEngine:
             evidence = _merge_graph_evidence(session, question, evidence)
             group = _synthesis_group(payload["documents"], interview["cohortId"], evidence)
             plan = plan_synthesis(question, group, retrieved_ids={item["id"] for item in evidence})
-            transcripts_sufficient = self._transcripts_sufficient(question, evidence)
+            transcripts_answer = plan["mode"] in {"direct", "conflict"} and bool(plan.get("reply"))
             if self.mcp is not None:
                 if hasattr(self.mcp, "stored") and not self.mcp.stored(session["sessionId"]):
                     mcp_rows = self._index_mcp(session, payload["documents"], session.get("knowledgeGraph") or {})
@@ -865,7 +860,7 @@ class ResearchEngine:
                         if any(row.get("ok") and row.get("database") == "vector" for row in mcp_rows):
                             index["vectorStore"] = "mcp"
                         self.store.write(session)
-                if not transcripts_sufficient:
+                if not transcripts_answer:
                     mcp_results = list(
                         self.mcp.gather(
                             question,
@@ -880,24 +875,11 @@ class ResearchEngine:
                         for item in _external_evidence(session, mcp_results)
                         if item.get("database") == "web"
                     ]
-                    transcripts_answer = plan["mode"] in {"direct", "conflict"} and bool(plan.get("reply"))
-                    if external and not transcripts_answer:
+                    if external:
                         session.setdefault("externalEvidence", []).extend(external)
                         evidence = [*evidence, *external]
                         group = _synthesis_group(payload["documents"], interview["cohortId"], evidence)
                         plan = plan_synthesis(question, group, retrieved_ids={item["id"] for item in evidence})
-            if plan["mode"] in {"direct", "conflict"} and plan.get("reply") and not instruction:
-                stated = _stated_turn(
-                    session,
-                    interview,
-                    question,
-                    plan,
-                    evidence,
-                    group,
-                    mcp_results,
-                )
-                if stated is not None:
-                    return stated
         if outside:
             return _empty_turn(interview, question, "out_of_screener_bounds", mcp_results)
         if plan.get("conflicts") or (plan["mode"] in {"direct", "conflict"} and plan.get("reply")):
@@ -926,6 +908,7 @@ class ResearchEngine:
         mcp_results: list[dict],
         plan: dict,
     ) -> dict:
+        statements = required_statements(plan)
         raw = self.llm.respondent(
             json.dumps(
                 {
@@ -935,12 +918,17 @@ class ResearchEngine:
                     "bounds": card["bounds"],
                     "tension": card["tension"],
                     "marketPack": session["marketPack"],
+                    "persona": _session_persona(session),
                     "question": question,
                     "instruction": instruction,
                     "task": plan.get("mode") or "indirect",
+                    "requiredStatements": statements,
+                    "priorTurns": prior_turns(interview.get("turns") or []),
                     "synthesis": public_synthesis(plan),
                     "evidence": [
-                        {"id": item["id"], "kind": item["kind"], "text": item["text"]} for item in evidence
+                        _model_evidence(item)
+                        for item in evidence
+                        if not str(item.get("id") or "").startswith("GRAPH-")
                     ],
                 },
                 indent=2,
@@ -949,117 +937,49 @@ class ResearchEngine:
         allowed = {item["id"] for item in evidence if not str(item.get("id") or "").startswith("GRAPH-")}
         evidence_ids = [item for item in raw.get("evidenceIds") or [] if item in allowed]
         reply = str(raw.get("reply") or "").strip()
-        reply, evidence_ids, grounding = self._verify_reply(question, reply, evidence_ids, evidence)
+        reply, evidence_ids, removed = lock_citations(reply, evidence_ids, allowed)
+        reply, evidence_ids = enforce_required_statements(reply, evidence_ids, statements, allowed)
         leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
         pii = find_pii([{"id": "reply", "title": "", "text": reply}])
-        keeps_plan = model_respects_plan(plan, reply, evidence_ids)
-        abstain = bool(raw.get("abstain")) or not evidence_ids or not reply or leaked or bool(pii) or not keeps_plan
-        restored = fallback_plan(plan)
-        if abstain and not leaked and not pii and restored.get("reply"):
-            group = [
-                {
-                    "id": item["id"],
-                    "kind": item.get("kind"),
-                    "title": item.get("title", ""),
-                    "text": item.get("text", ""),
-                    "cohortIds": item.get("cohortIds", []),
-                    "score": item.get("score") or 0,
-                }
-                for item in evidence
-            ]
-            stated = _stated_turn(session, interview, question, restored, evidence, group, mcp_results)
-            if stated is not None:
-                return stated
-        if abstain and not leaked and not pii:
-            return self._answer_from_system(session, interview, card, question, instruction, mcp_results)
-        reason = None
-        if abstain:
-            if leaked:
-                reason = "brand_locked"
-            elif pii:
-                reason = "pii"
-            else:
-                reason = "uncited"
-        synthesis = public_synthesis(plan) if not abstain else blank_synthesis("none")
-        if not abstain and plan.get("mode") == "indirect":
+        if leaked or pii:
+            return _empty_turn(interview, question, "brand_locked" if leaked else "pii", mcp_results)
+        evidence_ids = [item for item in evidence_ids if item in allowed]
+        if not reply or not evidence_ids:
+            return _finish_turn(
+                interview,
+                question,
+                abstain=True,
+                reason="uncited",
+                reply="",
+                evidence_ids=[],
+                evidence=evidence,
+                mcp_results=mcp_results,
+                source=None,
+                synthesis=blank_synthesis("none"),
+            )
+        evidence_ids = [item for item in cited_ids(plan, evidence_ids) if item in allowed]
+        synthesis = public_synthesis(plan)
+        if plan.get("mode") == "indirect":
             synthesis["mode"] = "indirect"
-        if not abstain:
-            if grounding is None:
-                evidence_ids = cited_ids(plan, evidence_ids)
-            else:
-                evidence_ids = [item for item in evidence_ids if item in allowed]
         turn = _finish_turn(
             interview,
             question,
-            abstain=abstain,
-            reason=reason,
-            reply="" if abstain else reply,
-            evidence_ids=[] if abstain else evidence_ids,
+            abstain=False,
+            reason=None,
+            reply=reply,
+            evidence_ids=evidence_ids,
             evidence=evidence,
             mcp_results=mcp_results,
             source=None,
             synthesis=synthesis,
         )
-        if grounding is not None and not abstain:
+        if removed:
             used_web = any(str(item).startswith("WEB-") for item in evidence_ids)
-            turn["confidence"] = grounding_confidence(
-                supported=grounding["supported"],
-                removed=grounding["removed"],
-                used_web=used_web,
-            )
-            turn["grounding"] = {
-                "supported": grounding["supported"],
-                "removed": grounding["removed"],
-            }
-        if not abstain and plan.get("mode") in {"direct", "conflict"} and grounding is None:
+            turn["confidence"] = grounding_confidence(supported=True, removed=removed, used_web=used_web)
+            turn["grounding"] = {"supported": True, "removed": removed}
+        if plan.get("mode") in {"direct", "conflict"}:
             _note_direct_basis(turn, plan)
         return turn
-
-    def _transcripts_sufficient(self, question: str, evidence: list[dict]) -> bool:
-        if not evidence or not hasattr(self.llm, "grade_transcripts"):
-            return False
-        payload = [
-            {"id": item["id"], "text": str(item.get("text") or "")[:500]}
-            for item in evidence[:40]
-            if item.get("id")
-        ]
-        try:
-            grade = self.llm.grade_transcripts(question, payload)
-        except Exception as error:  # noqa: BLE001
-            print(f"[grounding] grade failed: {error}", flush=True)
-            return False
-        return bool(grade.get("sufficient"))
-
-    def _verify_reply(
-        self,
-        question: str,
-        reply: str,
-        evidence_ids: list[str],
-        evidence: list[dict],
-    ) -> tuple[str, list[str], dict | None]:
-        allowed = {item["id"] for item in evidence if item.get("id") and not str(item["id"]).startswith("GRAPH-")}
-        checked: dict | None = None
-        if reply and hasattr(self.llm, "verify_reply"):
-            documents = [
-                {"id": item["id"], "text": str(item.get("text") or "")[:1200]}
-                for item in evidence
-                if item.get("id") in allowed
-            ]
-            try:
-                checked = self.llm.verify_reply(question, reply, documents)
-            except Exception as error:  # noqa: BLE001
-                print(f"[grounding] verify failed: {error}", flush=True)
-                checked = None
-        if isinstance(checked, dict):
-            revised = str(checked.get("reply") or "").strip()
-            if revised:
-                reply = revised
-            if isinstance(checked.get("evidenceIds"), list):
-                evidence_ids = [item for item in checked["evidenceIds"] if item in allowed]
-        reply, evidence_ids, removed = lock_citations(reply, evidence_ids, allowed)
-        if checked is None:
-            return reply, evidence_ids, None
-        return reply, evidence_ids, {"supported": bool(checked.get("supported")), "removed": removed}
 
     def _answer_from_system(
         self,
@@ -1081,8 +1001,10 @@ class ResearchEngine:
                     "bounds": card["bounds"],
                     "tension": card["tension"],
                     "marketPack": session["marketPack"],
+                    "persona": _session_persona(session),
                     "question": question,
                     "instruction": instruction,
+                    "priorTurns": prior_turns(interview.get("turns") or []),
                     "evidence": [],
                     "systemDatasets": datasets,
                 },
@@ -1244,39 +1166,6 @@ def _ordered_evidence(retrieved: list[dict], group: list[dict], plan: dict) -> l
     return ordered
 
 
-def _stated_turn(
-    session: dict,
-    interview: dict,
-    question: str,
-    plan: dict,
-    evidence: list[dict],
-    group: list[dict],
-    mcp_results: list[dict],
-) -> dict | None:
-    reply = str(plan.get("reply") or "").strip()
-    evidence_ids = [item for item in plan.get("evidenceIds") or [] if item]
-    if not reply or not evidence_ids:
-        return None
-    leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
-    pii = find_pii([{"id": "reply", "title": "", "text": reply}])
-    if leaked or pii:
-        return _empty_turn(interview, question, "brand_locked" if leaked else "pii", mcp_results)
-    turn = _finish_turn(
-        interview,
-        question,
-        abstain=False,
-        reason=None,
-        reply=reply,
-        evidence_ids=evidence_ids,
-        evidence=_ordered_evidence(evidence, group, plan),
-        mcp_results=mcp_results,
-        source=None,
-        synthesis=public_synthesis(plan),
-    )
-    _note_direct_basis(turn, plan)
-    return turn
-
-
 def _note_direct_basis(turn: dict, plan: dict) -> None:
     confidence = dict(turn.get("confidence") or {})
     if plan.get("mode") == "direct" and plan.get("directDocumentId"):
@@ -1298,6 +1187,18 @@ def _empty_turn(interview: dict, question: str, reason: str, mcp_results: list[d
         mcp_results=mcp_results or [],
         source=None,
     )
+
+
+def _model_evidence(item: dict) -> dict:
+    row = {
+        "id": item["id"],
+        "kind": item.get("kind") or "",
+        "text": str(item.get("text") or "")[:1200],
+    }
+    status = passage_status(row["text"])
+    if status:
+        row["status"] = status
+    return row
 
 
 def _log_documents(engine: ResearchEngine, session: dict, turn: dict) -> list[dict]:
@@ -1478,6 +1379,11 @@ def _system_disclosure(reply: str) -> str:
         text = text[period + 2:].strip() if period != -1 else ""
     body = text or "I am answering from the system datasets."
     return f"{disclosure} {body}"
+
+
+def _session_persona(session: dict) -> str:
+    kit = session.get("kit") or {}
+    return str(kit.get("persona") or kit.get("purpose") or "").strip()
 
 
 def _fresh_guide(template: dict) -> dict:

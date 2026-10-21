@@ -4,13 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from synthetic_research.chat import parse_model_json
 from synthetic_research.corpus import campaign_sources, corpus_hash, validate_campaign
-from synthetic_research.deepinfra import RESPONDENT_SYSTEM, parse_model_json
 from synthetic_research.engine import ResearchEngine
 from synthetic_research.gates import ResearchError, quote_is_verbatim
 from synthetic_research.grounding import grounding_confidence, lock_citations
 from synthetic_research.knowledge_mcp import graph_query, graph_upsert, vector_query, vector_upsert
 from synthetic_research.mcp_client import ResearchMcp, first_public_https, public_https
+from synthetic_research.prompts import RESPONDENT_SYSTEM
 from synthetic_research.retrieve import build_index, retrieve
 from synthetic_research.s3_log import _merge
 from synthetic_research.store import SessionStore
@@ -188,27 +189,39 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(llm.datasets[0]["datasetId"], "DS-BLR-FILTER")
         self.assertIn("Whitefield", llm.datasets[0]["text"])
 
-    def test_uncited_model_still_answers_from_the_system(self):
-        class AbstainThenSystem(FakeLlm):
+    def test_uncited_indirect_reply_declines(self):
+        class Abstain(FakeLlm):
             def respondent(self, user: str) -> dict:
                 payload = json.loads(user)
-                if payload.get("source") == "system":
-                    return {"abstain": False, "reply": "I keep a can for the cab.", "evidenceIds": []}
+                self.calls = getattr(self, "calls", 0) + 1
+                self.source = payload.get("source")
                 return {"abstain": True, "reply": "", "evidenceIds": []}
 
+        pack = json.loads(json.dumps(PACK))
+        pack["documents"] = [
+            {
+                "id": "R-882",
+                "kind": "review",
+                "cohortIds": ["office-sippers"],
+                "title": "Medicinal can",
+                "text": "The sweetness sits on top of a chalky note.",
+            },
+            pack["documents"][-1],
+        ]
+        llm = Abstain()
         with tempfile.TemporaryDirectory() as tmp:
-            engine = ResearchEngine(SessionStore(Path(tmp)), AbstainThenSystem())
-            session = engine.open(PACK, actor="Meera")
+            engine = ResearchEngine(SessionStore(Path(tmp)), llm)
+            session = engine.open(pack, actor="Meera")
             engine.grant(session["sessionId"], "gold-1842", steward="Arjun")
             engine.compile_cards(session["sessionId"])
             engine.start_interview(session["sessionId"], "office-sippers")
-            turn = engine.ask(session["sessionId"], "office-sippers", "Walk me through a weekday morning drink.")
-        self.assertFalse(turn["abstain"])
-        self.assertEqual(turn["source"], "system")
+            turn = engine.ask(session["sessionId"], "office-sippers", "What did the sweetness get you?")
+        self.assertEqual(llm.calls, 1)
+        self.assertIsNone(llm.source)
+        self.assertTrue(turn["abstain"])
+        self.assertEqual(turn["abstainReason"], "uncited")
+        self.assertNotIn("source", turn)
         self.assertEqual(turn["evidenceIds"], [])
-        self.assertIn("No evidence was found", turn["reply"])
-        self.assertIn("from the system", turn["reply"])
-        self.assertEqual(turn["confidence"]["label"], "low")
 
     def test_web_mcp_tool_call_is_cited_when_the_campaign_has_no_span(self):
         class WebMcp:
@@ -407,14 +420,24 @@ class ResearchTests(unittest.TestCase):
 
     def test_a_reply_cannot_keep_a_document_it_was_not_given(self):
         reply, kept, removed = lock_citations(
-            "Field teams spend time on admin [UP-009-c5]. A blog says otherwise [WEB-4].",
-            ["WEB-4", "GRAPH-7", "UP-002-c1"],
-            {"UP-002-c1", "WEB-4", "GRAPH-7"},
+            "winning where we have the right to win [UP-009-c1, UP-003-c2].",
+            ["UP-003-c2", "WEB-4", "GRAPH-7"],
+            {"UP-003-c2", "WEB-4", "GRAPH-7"},
         )
-        self.assertEqual(removed, ["UP-009-c5"])
-        self.assertNotIn("UP-009-c5", reply)
+        self.assertEqual(removed, ["UP-009-c1"])
+        self.assertEqual(reply, "winning where we have the right to win.")
+        self.assertNotIn("UP-003-c2", reply)
+        self.assertIn("UP-003-c2", kept)
+        midsentence, midsentence_kept, _ = lock_citations(
+            "The approach breaks down [UP-003-c2] because the data is split.",
+            ["UP-003-c2"],
+            {"UP-003-c2"},
+        )
+        self.assertEqual(midsentence, "The approach breaks down because the data is split.")
+        self.assertEqual(midsentence_kept, ["UP-003-c2"])
+        self.assertNotIn("[,", reply)
         self.assertNotIn("GRAPH-7", kept)
-        self.assertEqual(kept, ["WEB-4", "UP-002-c1"])
+        self.assertNotIn("WEB-4", kept)
         self.assertEqual(grounding_confidence(supported=False, removed=removed, used_web=False)["label"], "medium")
         self.assertEqual(grounding_confidence(supported=True, removed=[], used_web=False)["score"], 1.0)
 
