@@ -1,8 +1,79 @@
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
+from synthetic_research.engine import ResearchEngine
 from synthetic_research.prompts import RESPONDENT_SYSTEM, compose_respondent_system, respondent_messages
-from synthetic_research.respondent_turn import enforce_required_statements, prior_turns, required_statements
+from synthetic_research.respondent_turn import (
+    LEDGER_LIMIT,
+    bounded_model_evidence,
+    enforce_required_statements,
+    prior_commitments,
+    prior_turns,
+    required_statements,
+)
+from synthetic_research.store import SessionStore
+
+PACK = {
+    "campaignId": "CAM-1842",
+    "grantId": "gold-1842",
+    "kit": {"version": "v3", "locked": True, "brandAlias": "Aroha", "purpose": "RTD coffee"},
+    "marketPack": {"market": "IN", "taboos": []},
+    "cohorts": [
+        {
+            "id": "office-sippers",
+            "cardId": "R1",
+            "label": "Office sipper",
+            "rule": "Office sippers 25–34",
+            "bounds": ["25–34", "not tea-only"],
+            "traits": [],
+            "tension": "cafe taste / value price",
+            "affinity": [],
+        }
+    ],
+    "guide": {
+        "mains": [{"id": "m1", "phase": "rapport", "text": "Walk me through a weekday morning drink."}],
+        "probes": [],
+    },
+    "documents": [
+        {
+            "id": "T-14",
+            "kind": "transcript",
+            "cohortIds": ["office-sippers"],
+            "title": "Desk",
+            "text": "A can looks like I packed breakfast. I can drink it at the desk.",
+        },
+        {
+            "id": "R-882",
+            "kind": "review",
+            "cohortIds": ["office-sippers"],
+            "title": "Medicinal",
+            "text": "The sweetness sits on top of a chalky note.",
+        },
+        {
+            "id": "S-01",
+            "kind": "screener",
+            "cohortIds": ["office-sippers"],
+            "members": 12410,
+            "title": "Incidence",
+            "text": "Member count in this gold slice is 12410.",
+        },
+    ],
+}
+
+
+class FakeLlm:
+    last_payload: dict | None = None
+
+    def respondent(self, user: str) -> dict:
+        FakeLlm.last_payload = json.loads(user)
+        evidence = FakeLlm.last_payload["evidence"]
+        return {"abstain": False, "reply": evidence[0]["text"][:120], "evidenceIds": [evidence[0]["id"]]}
+
+    def pack(self, user: str) -> dict:
+        del user
+        return {"cohorts": [], "disclosureNote": "Exploratory. Not a population claim."}
 
 
 class RespondentTurnTests(unittest.TestCase):
@@ -85,11 +156,43 @@ class RespondentTurnTests(unittest.TestCase):
         self.assertIn("would pay", reply)
         self.assertEqual(evidence_ids, ["T-14", "T-31"])
 
-    def test_history_keeps_the_last_four_cited_replies(self):
+    def test_history_keeps_the_last_two_cited_replies(self):
         turns = [{"question": f"q{index}", "reply": f"a{index}", "abstain": False} for index in range(6)]
         turns.append({"question": "skip", "reply": "", "abstain": True})
         history = prior_turns(turns)
-        self.assertEqual([item["question"] for item in history], ["q2", "q3", "q4", "q5"])
+        self.assertEqual([item["question"] for item in history], ["q4", "q5"])
+
+    def test_ledger_pulls_an_early_desk_commitment_on_a_later_desk_question(self):
+        turns = []
+        for index in range(16):
+            turns.append(
+                {
+                    "question": f"Unrelated topic {index}",
+                    "reply": f"Generic answer {index}",
+                    "abstain": False,
+                    "evidenceIds": ["T-99"],
+                }
+            )
+        turns[1] = {
+            "question": "What do you drink at the desk?",
+            "reply": "A can looks like I packed breakfast at the desk.",
+            "abstain": False,
+            "evidenceIds": ["T-14"],
+        }
+        ledger = prior_commitments("Tell me again about your desk drink routine.", turns)
+        questions = [row["question"] for row in ledger]
+        self.assertIn("What do you drink at the desk?", questions)
+        self.assertLessEqual(len(ledger), LEDGER_LIMIT)
+
+    def test_bounded_evidence_keeps_required_documents_and_caps_the_rest(self):
+        plan = {"mode": "direct", "directDocumentId": "T-1", "evidenceIds": ["T-1"]}
+        evidence = [
+            {"id": f"T-{index}", "kind": "transcript", "text": f"row {index}", "score": index / 10}
+            for index in range(1, 20)
+        ]
+        bounded = bounded_model_evidence(evidence, plan, extra_limit=8)
+        self.assertIn("T-1", [row["id"] for row in bounded])
+        self.assertEqual(len(bounded), 9)
 
     def test_persona_keeps_the_full_policy_and_history_is_chat(self):
         persona = "VP of Sales. Speak from the field."
@@ -99,6 +202,13 @@ class RespondentTurnTests(unittest.TestCase):
                     "persona": persona,
                     "source": None,
                     "priorTurns": [{"question": "What do you drink?", "reply": "A can at the desk."}],
+                    "priorCommitments": [
+                        {
+                            "question": "What do you drink?",
+                            "reply": "A can at the desk.",
+                            "evidenceIds": ["T-14"],
+                        }
+                    ],
                     "question": "And after that?",
                     "evidence": [],
                 }
@@ -112,4 +222,26 @@ class RespondentTurnTests(unittest.TestCase):
         self.assertEqual(messages[2], {"role": "assistant", "content": "A can at the desk."})
         current = json.loads(messages[-1]["content"])
         self.assertNotIn("priorTurns", current)
+        self.assertNotIn("priorCommitments", current)
         self.assertEqual(current["question"], "And after that?")
+
+    def test_engine_sends_prior_commitments_and_bounded_evidence(self):
+        class Recording(FakeLlm):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = ResearchEngine(SessionStore(Path(tmp)), Recording())
+            session = engine.open(PACK, actor="Meera")
+            engine.grant(session["sessionId"], "gold-1842", steward="Arjun")
+            engine.compile_cards(session["sessionId"])
+            engine.start_interview(session["sessionId"], "office-sippers")
+            engine.ask(session["sessionId"], "office-sippers", "What do you drink at the desk?")
+            engine.ask(session["sessionId"], "office-sippers", "Tell me again about your desk drink routine.")
+        payload = Recording.last_payload or {}
+        self.assertIn("priorCommitments", payload)
+        self.assertGreaterEqual(len(payload["priorCommitments"]), 1)
+        self.assertLessEqual(len(payload["evidence"]), 9)
+
+
+if __name__ == "__main__":
+    unittest.main()

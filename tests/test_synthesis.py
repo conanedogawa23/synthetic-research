@@ -433,6 +433,7 @@ class SynthesisEngineTests(unittest.TestCase):
     def test_prompt_keeps_indirect_inference_and_conflict_sides_for_the_model(self):
         self.assertIn("When task is indirect", RESPONDENT_SYSTEM)
         self.assertIn("When requiredStatements is not empty", RESPONDENT_SYSTEM)
+        self.assertIn("priorCommitments", RESPONDENT_SYSTEM)
         self.assertIn("Do not merge a recorded conflict into one preference", RESPONDENT_SYSTEM)
         self.assertIn("If a cited turn lists conflicts", PACK_SYSTEM)
 

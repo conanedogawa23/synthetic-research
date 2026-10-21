@@ -17,6 +17,7 @@ RESPONDENT_SYSTEM = (
     "When several transcripts add different facts, include each fact. Do not collapse them into one theme, and do not swap in a different transcript on a later ask. "
     "Return one JSON object with keys abstain (boolean), reply (string), evidenceIds (array of strings). "
     "When requiredStatements is not empty, copy each statement text into the reply and list its documentIds in evidenceIds. "
+    "When priorCommitments is not empty, stay consistent with those earlier answers and evidenceIds. Do not drop a recorded conflict. "
     "Stay consistent with the earlier turns of this interview. "
     "evidenceIds must list every evidence id the reply rests on, not only the single closest document. "
     "A contrast inside a span is an answer. Cite the span. "
@@ -89,10 +90,14 @@ def respondent_messages(user: str) -> list[dict]:
         source = payload.get("source") if isinstance(payload.get("source"), str) else None
         raw_prior = payload.get("priorTurns")
         prior = raw_prior if isinstance(raw_prior, list) else []
-        current = {key: value for key, value in payload.items() if key != "priorTurns"}
+        current = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"priorTurns", "priorCommitments"}
+        }
         body = json.dumps(current, indent=2)
     messages = [{"role": "system", "content": compose_respondent_system(persona, source=source)}]
-    for turn in prior[-4:]:
+    for turn in prior[-2:]:
         if not isinstance(turn, dict):
             continue
         question = str(turn.get("question") or "").strip()

@@ -17,7 +17,13 @@ from synthetic_research.gates import (
 )
 from synthetic_research.grounding import grounding_confidence, lock_citations, passage_status
 from synthetic_research.knowledge import build_graph, chunk_text, read_upload
-from synthetic_research.respondent_turn import enforce_required_statements, prior_turns, required_statements
+from synthetic_research.respondent_turn import (
+    bounded_model_evidence,
+    enforce_required_statements,
+    prior_commitments,
+    prior_turns,
+    required_statements,
+)
 from synthetic_research.retrieve import SOURCE_KINDS, tokenize
 from synthetic_research.s3_log import log_question
 from synthetic_research.search import retrieve_evidence
@@ -911,6 +917,10 @@ class ResearchEngine:
         plan: dict,
     ) -> dict:
         statements = required_statements(plan)
+        model_evidence = bounded_model_evidence(
+            [item for item in evidence if not str(item.get("id") or "").startswith("GRAPH-")],
+            plan,
+        )
         raw = self.llm.respondent(
             json.dumps(
                 {
@@ -926,17 +936,14 @@ class ResearchEngine:
                     "task": plan.get("mode") or "indirect",
                     "requiredStatements": statements,
                     "priorTurns": prior_turns(interview.get("turns") or []),
+                    "priorCommitments": prior_commitments(question, interview.get("turns") or []),
                     "synthesis": public_synthesis(plan),
-                    "evidence": [
-                        _model_evidence(item)
-                        for item in evidence
-                        if not str(item.get("id") or "").startswith("GRAPH-")
-                    ],
+                    "evidence": [_model_evidence(item) for item in model_evidence],
                 },
                 indent=2,
             )
         )
-        allowed = {item["id"] for item in evidence if not str(item.get("id") or "").startswith("GRAPH-")}
+        allowed = {item["id"] for item in model_evidence if item.get("id")}
         evidence_ids = [item for item in raw.get("evidenceIds") or [] if item in allowed]
         reply = str(raw.get("reply") or "").strip()
         reply, evidence_ids, removed = lock_citations(reply, evidence_ids, allowed)
@@ -1007,6 +1014,7 @@ class ResearchEngine:
                     "question": question,
                     "instruction": instruction,
                     "priorTurns": prior_turns(interview.get("turns") or []),
+                    "priorCommitments": prior_commitments(question, interview.get("turns") or []),
                     "evidence": [],
                     "systemDatasets": datasets,
                 },
