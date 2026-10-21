@@ -290,7 +290,9 @@ class SynthesisEngineTests(unittest.TestCase):
             engine, session_id = self._engine(tmp, OneSide(), pack)
             restored = engine.ask(session_id, "office-sippers", "Who brews the coffee?")
         self.assertEqual(restored["synthesis"]["mode"], "indirect")
-        self.assertEqual(restored["reply"], "The morning drink is mine.")
+        self.assertIn("The morning drink is mine.", restored["reply"])
+        self.assertIn("My mother makes coffee before I leave.", restored["reply"])
+        self.assertIn("At the office canteen I still look for filter.", restored["reply"])
         self.assertIn("T-06", restored["evidenceIds"])
 
     def test_the_next_question_receives_the_previous_reply(self):

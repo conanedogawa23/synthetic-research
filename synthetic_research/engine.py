@@ -949,11 +949,6 @@ class ResearchEngine:
         reply = str(raw.get("reply") or "").strip()
         reply, evidence_ids, removed = lock_citations(reply, evidence_ids, allowed)
         reply, evidence_ids = enforce_required_statements(reply, evidence_ids, statements, allowed)
-        reply = restore_cited_specifics(reply, evidence_ids, model_evidence)
-        leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
-        pii = find_pii([{"id": "reply", "title": "", "text": reply}])
-        if leaked or pii:
-            return _empty_turn(interview, question, "brand_locked" if leaked else "pii", mcp_results)
         evidence_ids = [item for item in evidence_ids if item in allowed]
         if not reply or not evidence_ids:
             return _finish_turn(
@@ -969,6 +964,11 @@ class ResearchEngine:
                 synthesis=blank_synthesis("none"),
             )
         evidence_ids = [item for item in cited_ids(plan, evidence_ids) if item in allowed]
+        reply = restore_cited_specifics(reply, evidence_ids, model_evidence)
+        leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
+        pii = find_pii([{"id": "reply", "title": "", "text": reply}])
+        if leaked or pii:
+            return _empty_turn(interview, question, "brand_locked" if leaked else "pii", mcp_results)
         synthesis = public_synthesis(plan)
         if plan.get("mode") == "indirect":
             synthesis["mode"] = "indirect"
