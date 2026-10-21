@@ -110,8 +110,8 @@ def _meta_suffix(turn: dict) -> str:
 
 
 def interview_cohort(engine: ResearchEngine, session_id: str, pack: dict, cohort_id: str, events: list[str]) -> None:
-    engine.start_interview(session_id, cohort_id)
-    _note(events, f"Started {cohort_id}. Phase rapport. Kit locked. Turns left 10.")
+    interview = engine.start_interview(session_id, cohort_id)
+    _note(events, f"Started {cohort_id}. Phase rapport. Kit locked. Turns left {interview['turnCap']}.")
     improved = False
     brand_checked = False
     tea_checked = False

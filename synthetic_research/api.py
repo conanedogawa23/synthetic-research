@@ -16,7 +16,7 @@ from synthetic_research.chat import ChatClient
 from synthetic_research.config import assert_inference_config, read_config
 from synthetic_research.corpus import validate_campaign
 from synthetic_research.embeddings import EmbedClient
-from synthetic_research.engine import ResearchEngine
+from synthetic_research.engine import TURN_CAP, ResearchEngine
 from synthetic_research.gates import ResearchError
 from synthetic_research.grounding import visible_evidence_ids
 from synthetic_research.mcp_client import ResearchMcp, enable_session_mcp
@@ -499,7 +499,7 @@ def _interview(session: dict, interview: dict) -> dict:
         "status": "ended" if interview.get("status") == "ended" else "open",
         "phase": interview.get("phase") or "rapport",
         "turnsUsed": interview.get("turnsUsed") or 0,
-        "turnCap": interview.get("turnCap") or 10,
+        "turnCap": interview.get("turnCap") or TURN_CAP,
         "turns": _turns(session, interview),
     }
 
