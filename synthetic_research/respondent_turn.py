@@ -36,6 +36,14 @@ THIN_WORD_LIMIT = 45
 SHORT_SPAN_WORDS = 60
 LONG_SPAN_CHARS = 350
 FIGURE_RESTORE_LIMIT = 3
+_INTERPERSONAL = re.compile(
+    r"\bwho\b|\bwhom\b|who else|with you|in that moment|anyone else|anybody else",
+    re.IGNORECASE,
+)
+_PRESENCE = re.compile(
+    r"\bflatmate\b|\basleep\b|\balone\b|\bmother\b|\bfather\b|\bpartner\b|\bhousehold\b|\bflat\b",
+    re.IGNORECASE,
+)
 
 CHAT_TURN_LIMIT = 2
 LEDGER_LIMIT = 12
@@ -285,6 +293,31 @@ def _is_long_span(text: str) -> bool:
     return len(body) > LONG_SPAN_CHARS or _span_word_count(body) > SHORT_SPAN_WORDS
 
 
+def interpersonal_question(question: str) -> bool:
+    return bool(_INTERPERSONAL.search(question or ""))
+
+
+def _mentions_presence(text: str) -> bool:
+    return bool(_PRESENCE.search(text or ""))
+
+
+def _merge_evidence_lookup(
+    model_evidence: list[dict],
+    corpus_evidence: list[dict] | None,
+) -> dict[str, dict]:
+    by_id: dict[str, dict] = {}
+    for item in (corpus_evidence or []) + list(model_evidence):
+        document_id = str(item.get("id") or "")
+        if not document_id:
+            continue
+        prev = by_id.get(document_id)
+        prev_len = len(str(prev.get("text") or "")) if prev else 0
+        new_len = len(str(item.get("text") or ""))
+        if prev is None or new_len > prev_len:
+            by_id[document_id] = item
+    return by_id
+
+
 def _covered(reply_norm: str, sentence: str) -> bool:
     norm = _normalize(sentence)
     if norm and norm in reply_norm:
@@ -300,16 +333,15 @@ def _covered(reply_norm: str, sentence: str) -> bool:
 def restore_cited_specifics(
     reply: str,
     evidence_ids: list[str],
-    evidence: list[dict],
+    model_evidence: list[dict],
     *,
     question: str = "",
-) -> str:
+    corpus_evidence: list[dict] | None = None,
+    allowed: set[str] | None = None,
+) -> tuple[str, list[str]]:
     """Keep the model's answer. Restore missing figures the question calls for, not whole files."""
-    by_id: dict[str, dict] = {}
-    for item in evidence:
-        document_id = str(item.get("id") or "")
-        if document_id and document_id not in by_id:
-            by_id[document_id] = item
+    by_id = _merge_evidence_lookup(model_evidence, corpus_evidence)
+    kept_ids = [item for item in evidence_ids if item in allowed] if allowed else list(evidence_ids)
     cited_text = " ".join(str(by_id.get(document_id, {}).get("text") or "") for document_id in evidence_ids)
     cited_norm = _normalize(cited_text)
     kept: list[str] = []
@@ -349,25 +381,61 @@ def restore_cited_specifics(
         reply_norm = f"{reply_norm} {norm}".strip()
         present |= _figure_keys(sentence)
 
-    if _span_word_count(text) >= THIN_WORD_LIMIT:
-        return " ".join(text.split())
-
-    for document_id in evidence_ids:
-        item = by_id.get(document_id) or {}
-        if str(item.get("kind") or "") == "screener":
-            continue
-        body = str(item.get("text") or "")
-        if _is_long_span(body):
-            continue
-        for sentence in _clauses(body):
-            if _SCREENER.search(sentence) or _is_case_material(sentence) or _covered(reply_norm, sentence):
+    if _span_word_count(text) < THIN_WORD_LIMIT:
+        for document_id in evidence_ids:
+            item = by_id.get(document_id) or {}
+            if str(item.get("kind") or "") == "screener":
                 continue
-            norm = _normalize(sentence)
-            if not norm or norm in reply_norm:
+            body = str(item.get("text") or "")
+            if _is_long_span(body):
                 continue
-            text = f"{text} {sentence}".strip()
-            reply_norm = f"{reply_norm} {norm}".strip()
-            present |= _figure_keys(sentence)
+            for sentence in _clauses(body):
+                if _SCREENER.search(sentence) or _is_case_material(sentence) or _covered(reply_norm, sentence):
+                    continue
+                norm = _normalize(sentence)
+                if not norm or norm in reply_norm:
+                    continue
+                text = f"{text} {sentence}".strip()
+                reply_norm = f"{reply_norm} {norm}".strip()
+                present |= _figure_keys(sentence)
+                if _span_word_count(text) >= THIN_WORD_LIMIT:
+                    break
             if _span_word_count(text) >= THIN_WORD_LIMIT:
-                return " ".join(text.split())
-    return " ".join(text.split())
+                break
+    text = " ".join(text.split())
+
+    if interpersonal_question(question) and not _mentions_presence(text):
+        allowed_ids = allowed if allowed is not None else set(by_id)
+        candidates: list[tuple[int, str, str]] = []
+        corpus = sorted(
+            (corpus_evidence or list(by_id.values())),
+            key=lambda row: (-float(row.get("score") or 0), str(row.get("id") or "")),
+        )
+        for item in corpus:
+            document_id = str(item.get("id") or "")
+            if not document_id or document_id not in allowed_ids:
+                continue
+            if str(item.get("kind") or "") not in {"transcript", "review"}:
+                continue
+            for sentence in _clauses(str(item.get("text") or "")):
+                if _SCREENER.search(sentence) or _is_case_material(sentence):
+                    continue
+                if not _mentions_presence(sentence):
+                    continue
+                if _normalize(sentence) in reply_norm:
+                    continue
+                overlap = _question_overlap(question, sentence)
+                if overlap < 1 and not _mentions_presence(sentence):
+                    continue
+                candidates.append((overlap + (2 if item.get("kind") == "transcript" else 0), sentence, document_id))
+        candidates.sort(key=lambda row: (-row[0], row[1]))
+        if candidates:
+            _score, sentence, document_id = candidates[0]
+            norm = _normalize(sentence)
+            if norm and norm not in reply_norm:
+                text = f"{text} {sentence}".strip()
+                reply_norm = f"{reply_norm} {norm}".strip()
+                if document_id not in kept_ids:
+                    kept_ids.append(document_id)
+
+    return " ".join(text.split()), kept_ids

@@ -1,4 +1,15 @@
+import re
+
 from synthetic_research.retrieve import build_index, retrieve
+
+_INTERPERSONAL = re.compile(
+    r"\bwho\b|\bwhom\b|who else|with you|in that moment|anyone else|anybody else",
+    re.IGNORECASE,
+)
+_PRESENCE = re.compile(
+    r"\bflatmate\b|\basleep\b|\balone\b|\bmother\b|\bfather\b|\bpartner\b|\bhousehold\b",
+    re.IGNORECASE,
+)
 
 
 def cosine(left: list[float], right: list[float]) -> float:
@@ -41,6 +52,16 @@ def retrieve_evidence(
             score = lexical_score
         ranked.append((score, semantic, document))
     ranked.sort(key=lambda row: (-row[0], row[2].get("id") or ""))
+    if _INTERPERSONAL.search(query or ""):
+        boosted: list[tuple[float, float, dict]] = []
+        for score, semantic, document in ranked:
+            bump = 0.0
+            if _PRESENCE.search(document.get("text") or ""):
+                bump += 0.22
+            if document.get("kind") == "transcript" and bump:
+                bump += 0.05
+            boosted.append((score + bump, semantic, document))
+        ranked = sorted(boosted, key=lambda row: (-row[0], row[2].get("id") or ""))
     chosen = ranked if limit is None else ranked[:limit]
     return [
         {

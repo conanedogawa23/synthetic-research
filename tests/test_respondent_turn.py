@@ -12,6 +12,7 @@ from synthetic_research.respondent_turn import (
     prior_commitments,
     prior_turns,
     required_statements,
+    interpersonal_question,
     restore_cited_specifics,
 )
 from synthetic_research.store import SessionStore
@@ -245,7 +246,7 @@ class RespondentTurnTests(unittest.TestCase):
         self.assertLessEqual(len(payload["evidence"]), 9)
 
     def test_a_paraphrase_gets_the_cited_count_and_price_back(self):
-        reply = restore_cited_specifics(
+        reply, _ids = restore_cited_specifics(
             "Filter coffee is what I drink before I sit down at the office.",
             ["SL-EC"],
             [
@@ -268,7 +269,7 @@ class RespondentTurnTests(unittest.TestCase):
 
     def test_a_figure_already_in_the_reply_is_not_pasted_again(self):
         sentence = "The filter counter sold 22110 cups in the last 18 months at about 25 rupees."
-        reply = restore_cited_specifics(
+        reply, _ids = restore_cited_specifics(
             f"I still buy filter. {sentence}",
             ["SL-EC"],
             [{"id": "SL-EC", "kind": "sales", "text": sentence}],
@@ -276,7 +277,7 @@ class RespondentTurnTests(unittest.TestCase):
         self.assertEqual(reply.count("22110"), 1)
 
     def test_a_one_line_answer_keeps_the_rest_of_the_cited_span(self):
-        reply = restore_cited_specifics(
+        reply, _ids = restore_cited_specifics(
             "I tried a sweet can.",
             ["T-06"],
             [
@@ -296,7 +297,7 @@ class RespondentTurnTests(unittest.TestCase):
         self.assertIn("Gurgaon", reply)
 
     def test_screener_boilerplate_is_removed_when_the_cited_span_does_not_say_it(self):
-        reply = restore_cited_specifics(
+        reply, _ids = restore_cited_specifics(
             "The morning drink is mine. Respondents who do not drink coffee are out of scope. "
             "Metro office drinkers age 25 to 34 who bought ready-to-drink coffee in the last 90 days.",
             ["T-06"],
@@ -315,7 +316,7 @@ class RespondentTurnTests(unittest.TestCase):
             "The workforce grew to 12,050 field personnel across more than 30 markets.\n"
             "Selling and commercial expenses rose to €1.49 billion."
         )
-        reply = restore_cited_specifics(
+        reply, _ids = restore_cited_specifics(
             "The focus is profitable growth and commercial productivity in the market.",
             ["ST-01"],
             [{"id": "ST-01", "kind": "transcript", "text": earnings}],
@@ -327,6 +328,55 @@ class RespondentTurnTests(unittest.TestCase):
         self.assertNotIn("12,050 field personnel", reply)
         self.assertNotIn("€1.49 billion", reply)
         self.assertLessEqual(len(reply.split()), 80)
+
+    def test_interpersonal_question_detects_who_is_with_you(self):
+        self.assertTrue(interpersonal_question("Who else is in that moment with you?"))
+        self.assertTrue(interpersonal_question("Who is with you when you drink that morning coffee?"))
+
+    def test_interpersonal_restore_adds_flatmate_from_corpus(self):
+        reply, ids = restore_cited_specifics(
+            "The morning drink is mine.",
+            ["T-06"],
+            [],
+            question="Who is with you when you drink that morning coffee?",
+            corpus_evidence=[
+                {
+                    "id": "T-06",
+                    "kind": "transcript",
+                    "score": 0.9,
+                    "text": "The morning drink is mine. My flatmate is asleep.",
+                }
+            ],
+            allowed={"T-06", "R-640"},
+        )
+        self.assertIn("flatmate is asleep", reply)
+        self.assertIn("T-06", ids)
+
+    def test_interpersonal_restore_adds_flatmate_when_cab_review_was_cited(self):
+        reply, ids = restore_cited_specifics(
+            "I drink it in the cab and I do not talk about it.",
+            ["R-640"],
+            [
+                {
+                    "id": "R-640",
+                    "kind": "review",
+                    "text": "I drink it in the cab and I do not talk about it.",
+                }
+            ],
+            question="Who else is in that moment with you?",
+            corpus_evidence=[
+                {
+                    "id": "T-06",
+                    "kind": "transcript",
+                    "score": 0.8,
+                    "text": "The morning drink is mine. My flatmate is asleep.",
+                },
+                {"id": "R-640", "kind": "review", "score": 0.7, "text": "I drink it in the cab and I do not talk about it."},
+            ],
+            allowed={"T-06", "R-640"},
+        )
+        self.assertIn("flatmate is asleep", reply)
+        self.assertIn("T-06", ids)
 
 
 if __name__ == "__main__":
