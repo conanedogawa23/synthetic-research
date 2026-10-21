@@ -112,7 +112,7 @@ def graph_query(session_id: str, question: str) -> str:
     """Return graph edges whose labels share words with the question."""
     edges = (_read(session_id).get("graph") or {}).get("edges") or []
     if not edges:
-        raise ValueError("No graph is stored for this session.")
+        return ""
     question_tokens = set(_TOKEN.findall(question.lower()))
     ranked = []
     for edge in edges:
@@ -124,7 +124,7 @@ def graph_query(session_id: str, question: str) -> str:
             ranked.append((overlap, label))
     ranked.sort(key=lambda item: item[0], reverse=True)
     if not ranked:
-        raise ValueError("No graph edge matches this question.")
+        return ""
     return "\n".join(label for _, label in ranked[:8])
 
 

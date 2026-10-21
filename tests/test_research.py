@@ -10,7 +10,7 @@ from synthetic_research.engine import ResearchEngine
 from synthetic_research.gates import ResearchError, quote_is_verbatim
 from synthetic_research.grounding import grounding_confidence, lock_citations
 from synthetic_research.knowledge_mcp import graph_query, graph_upsert, vector_query, vector_upsert
-from synthetic_research.mcp_client import ResearchMcp, first_public_https, public_https
+from synthetic_research.mcp_client import ResearchMcp, _search_query, _uvx_command, first_public_https, public_https
 from synthetic_research.prompts import RESPONDENT_SYSTEM
 from synthetic_research.retrieve import build_index, retrieve
 from synthetic_research.s3_log import _merge
@@ -258,7 +258,8 @@ class ResearchTests(unittest.TestCase):
             chip = engine.open_evidence(session["sessionId"], "WEB-1")
         self.assertFalse(turn["abstain"])
         self.assertEqual(turn["evidenceIds"], ["WEB-1"])
-        self.assertEqual(turn["confidence"]["basis"], "cited score from web")
+        self.assertEqual(turn["confidence"]["label"], "low")
+        self.assertEqual(turn["confidence"]["basis"], "public web page, not this respondent's own record")
         self.assertEqual(turn["mcp"][0]["tool"], "fetch")
         self.assertFalse(turn["mcp"][1]["ok"])
         self.assertIn("cafe cup costs more", chip["text"])
@@ -293,6 +294,42 @@ class ResearchTests(unittest.TestCase):
         self.assertTrue(all(not item["ok"] for item in results))
         self.assertEqual(results[0]["tool"], "search")
 
+    def test_uvx_command_does_not_fall_back_to_homebrew(self):
+        from unittest.mock import patch
+
+        with patch("shutil.which", return_value=None):
+            with patch.object(Path, "home", return_value=Path("/tmp/no-uv-home")):
+                self.assertIsNone(_uvx_command())
+
+    def test_web_search_skips_when_uvx_is_missing(self):
+        keys = ("MCP_WEB", "BRAVE_API_KEY", "MCP_VECTOR", "MCP_GRAPH", "KNOWLEDGE_MCP_DIR")
+        saved = {key: os.environ.get(key) for key in keys}
+        os.environ["MCP_WEB"] = "true"
+        for key in keys:
+            if key != "MCP_WEB":
+                os.environ.pop(key, None)
+        try:
+            from unittest.mock import patch
+
+            client = ResearchMcp()
+            with patch("synthetic_research.mcp_client._uvx_command", return_value=None):
+                results = client.gather("filter coffee", "office-sippers")
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual(results[0]["database"], "web")
+        self.assertFalse(results[0]["ok"])
+        self.assertIn("uvx", results[0]["error"].lower())
+
+    def test_web_search_includes_the_respondent_role(self):
+        query = _search_query("Where does the handoff break down?", "VP of Sales for a field team in India.")
+        self.assertIn("VP of Sales", query)
+        self.assertIn("handoff", query)
+        self.assertLessEqual(len(query), 400)
+
     def test_web_search_uses_duckduckgo_without_an_api_key(self):
         keys = (
             "MCP_WEB",
@@ -321,9 +358,12 @@ class ResearchTests(unittest.TestCase):
             return "The office filter counter is the weekday cup."
 
         try:
+            from unittest.mock import patch
+
             client = ResearchMcp()
             client.call_tool = fake_call
-            results = client.gather("filter coffee in Bengaluru", "office-sippers")
+            with patch("synthetic_research.mcp_client._uvx_command", return_value="/usr/bin/uvx"):
+                results = client.gather("filter coffee in Bengaluru", "office-sippers")
         finally:
             for key, value in saved.items():
                 if value is None:
@@ -384,6 +424,11 @@ class ResearchTests(unittest.TestCase):
                 )
                 linked = graph_query(session_id, "Who supports the field teams?")
                 self.assertIn("Frontline supports field teams", linked)
+                self.assertEqual(graph_query(session_id, "quantum unrelated topic"), "")
+                self.assertEqual(
+                    graph_query("b9cbd64f-f3d8-45c9-8141-c8fde0c84e4e", "Who supports the field teams?"),
+                    "",
+                )
                 client = ResearchMcp()
                 os.environ["MCP_VECTOR"] = "true"
                 os.environ["MCP_GRAPH"] = "true"

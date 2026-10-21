@@ -5,6 +5,7 @@ from pathlib import Path
 
 from synthetic_research.engine import ResearchEngine
 from synthetic_research.prompts import RESPONDENT_SYSTEM, compose_respondent_system, respondent_messages
+from synthetic_research.synthesis import answer_evidence_ids, cited_ids
 from synthetic_research.respondent_turn import (
     LEDGER_LIMIT,
     bounded_model_evidence,
@@ -14,6 +15,7 @@ from synthetic_research.respondent_turn import (
     required_statements,
     interpersonal_question,
     restore_cited_specifics,
+    restrain_future_as_current,
 )
 from synthetic_research.store import SessionStore
 
@@ -195,6 +197,77 @@ class RespondentTurnTests(unittest.TestCase):
         bounded = bounded_model_evidence(evidence, plan, extra_limit=8)
         self.assertIn("T-1", [row["id"] for row in bounded])
         self.assertEqual(len(bounded), 9)
+
+    def test_bounded_evidence_includes_indirect_ranked_documents(self):
+        ranked = [
+            {"id": f"UP-{index}", "kind": "transcript", "relation": "indirect", "score": 0.2}
+            for index in range(1, 5)
+        ]
+        plan = {"mode": "indirect", "ranked": ranked}
+        evidence = [
+            {"id": f"T-{index}", "kind": "transcript", "text": f"row {index}", "score": 1.0 - index / 100}
+            for index in range(1, 20)
+        ] + [{"id": f"UP-{index}", "kind": "transcript", "text": f"indirect {index}", "score": 0.2} for index in range(1, 5)]
+        bounded = bounded_model_evidence(evidence, plan, extra_limit=8)
+        bounded_ids = {row["id"] for row in bounded}
+        for index in range(1, 5):
+            self.assertIn(f"UP-{index}", bounded_ids)
+
+    def test_indirect_cited_ids_stay_in_retrieval_not_only_model_prompt_slice(self):
+        ranked = [
+            {"id": f"UP-{index}", "kind": "transcript", "relation": "indirect", "score": 0.2}
+            for index in range(1, 5)
+        ]
+        plan = {"mode": "indirect", "ranked": ranked}
+        model_citations = ["T-15"]
+        citable = {f"T-{index}" for index in range(1, 20)} | {f"UP-{index}" for index in range(1, 5)}
+        model_prompt_allowed = {f"T-{index}" for index in range(15, 20)}
+        normalized = [item for item in cited_ids(plan, model_citations) if item in citable]
+        self.assertEqual(normalized[:4], ["UP-1", "UP-2", "UP-3", "UP-4"])
+        legacy_filter = [item for item in cited_ids(plan, model_citations) if item in model_prompt_allowed]
+        self.assertFalse(legacy_filter)
+
+    def test_answer_chips_keep_the_model_document_on_an_indirect_question(self):
+        plan = {
+            "mode": "indirect",
+            "ranked": [
+                {"id": "UP-1", "kind": "transcript", "relation": "indirect", "score": 0.2},
+                {"id": "UP-2", "kind": "transcript", "relation": "indirect", "score": 0.2},
+            ],
+        }
+        citable = {"UP-1", "UP-2", "T-15"}
+        chips = answer_evidence_ids(plan, ["T-15"], citable)
+        self.assertEqual(chips, ["T-15"])
+
+    def test_a_cited_example_is_kept_when_the_reply_omits_it(self):
+        reply, ids = restore_cited_specifics(
+            "The handoff is where the week slips.",
+            ["T-2"],
+            [
+                {
+                    "id": "T-2",
+                    "kind": "transcript",
+                    "text": "The handoff is where the week slips. For example, the handoff sits for two days before the distributor sees it.",
+                }
+            ],
+            question="Where does the handoff break down?",
+        )
+        self.assertIn("For example, the handoff sits for two days", reply)
+        self.assertIn("T-2", ids)
+
+    def test_future_ai_is_not_described_as_the_current_approach(self):
+        reply = restrain_future_as_current(
+            "Where does the current approach break down?",
+            "We use AI to score every outlet today.",
+            [
+                {
+                    "id": "UP-9",
+                    "text": "AI is a future consideration for outlet scoring, not the current approach.",
+                }
+            ],
+        )
+        self.assertNotIn("We use AI", reply)
+        self.assertIn("future consideration", reply)
 
     def test_persona_keeps_the_full_policy_and_history_is_chat(self):
         persona = "VP of Sales. Speak from the field."

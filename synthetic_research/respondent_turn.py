@@ -36,6 +36,20 @@ THIN_WORD_LIMIT = 45
 SHORT_SPAN_WORDS = 60
 LONG_SPAN_CHARS = 350
 FIGURE_RESTORE_LIMIT = 3
+EXAMPLE_RESTORE_LIMIT = 1
+_EXAMPLE = re.compile(r"\b(?:for example|for instance|such as)\b", re.IGNORECASE)
+_CURRENT_QUESTION = re.compile(
+    r"\b(?:current approach|currently|right now|today|at the moment)\b",
+    re.IGNORECASE,
+)
+_FUTURE_MARK = re.compile(
+    r"\b(?:future|planned|planning|roadmap|under consideration|considering|next phase|not yet|pilot|exploring)\b",
+    re.IGNORECASE,
+)
+_AI_TOPIC = re.compile(
+    r"\b(?:AI|artificial intelligence|algorithm|machine learning|generative)\b",
+    re.IGNORECASE,
+)
 _INTERPERSONAL = re.compile(
     r"\bwho\b|\bwhom\b|who else|with you|in that moment|anyone else|anybody else",
     re.IGNORECASE,
@@ -138,6 +152,19 @@ def bounded_model_evidence(evidence: list[dict], plan: dict, *, extra_limit: int
         if row and document_id not in seen:
             chosen.append(row)
             seen.add(document_id)
+    if plan.get("mode") == "indirect":
+        added_indirect = 0
+        for row in plan.get("ranked") or []:
+            if row.get("relation") != "indirect" or row.get("kind") == "screener":
+                continue
+            document_id = str(row.get("id") or "")
+            row_doc = by_id.get(document_id)
+            if row_doc and document_id not in seen:
+                chosen.append(row_doc)
+                seen.add(document_id)
+                added_indirect += 1
+            if added_indirect >= 4:
+                break
     remaining = [item for item in evidence if str(item.get("id") or "") not in seen]
     remaining.sort(key=lambda row: (-float(row.get("score") or 0), str(row.get("id") or "")))
     added = 0
@@ -383,6 +410,31 @@ def restore_cited_specifics(
         reply_norm = f"{reply_norm} {norm}".strip()
         present |= _figure_keys(sentence)
 
+    examples_added = 0
+    for document_id in evidence_ids:
+        item = by_id.get(document_id) or {}
+        if str(item.get("kind") or "") == "screener":
+            continue
+        for sentence in _clauses(str(item.get("text") or "")):
+            if examples_added >= EXAMPLE_RESTORE_LIMIT:
+                break
+            if _is_long_span(sentence) or _SCREENER.search(sentence) or _is_case_material(sentence):
+                continue
+            if not _EXAMPLE.search(sentence) or _covered(reply_norm, sentence):
+                continue
+            if _question_overlap(question, sentence) < 1:
+                continue
+            norm = _normalize(sentence)
+            if not norm or norm in reply_norm:
+                continue
+            text = f"{text} {sentence}".strip()
+            reply_norm = f"{reply_norm} {norm}".strip()
+            examples_added += 1
+            if document_id not in kept_ids:
+                kept_ids.append(document_id)
+        if examples_added >= EXAMPLE_RESTORE_LIMIT:
+            break
+
     if _span_word_count(text) < THIN_WORD_LIMIT and interpersonal_question(question):
         for document_id in evidence_ids:
             item = by_id.get(document_id) or {}
@@ -464,3 +516,24 @@ def restore_cited_specifics(
                     kept_ids.append(document_id)
 
     return " ".join(text.split()), kept_ids
+
+
+def restrain_future_as_current(question: str, reply: str, evidence: list[dict]) -> str:
+    """A future or pilot mention of AI is not the current approach."""
+    if not _CURRENT_QUESTION.search(question or ""):
+        return reply
+    corpus_sentences: list[str] = []
+    for item in evidence or []:
+        corpus_sentences.extend(_clauses(str(item.get("text") or "")))
+    ai_sentences = [sentence for sentence in corpus_sentences if _AI_TOPIC.search(sentence)]
+    if not ai_sentences or not all(_FUTURE_MARK.search(sentence) for sentence in ai_sentences):
+        return reply
+    kept = [
+        sentence
+        for sentence in _clauses(reply)
+        if not (_AI_TOPIC.search(sentence) and not _FUTURE_MARK.search(sentence))
+    ]
+    text = " ".join(kept).strip()
+    if text:
+        return text
+    return "The documents describe that as a future consideration, not the current approach."

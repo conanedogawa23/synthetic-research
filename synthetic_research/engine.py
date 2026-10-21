@@ -24,11 +24,17 @@ from synthetic_research.respondent_turn import (
     prior_turns,
     required_statements,
     restore_cited_specifics,
+    restrain_future_as_current,
 )
 from synthetic_research.retrieve import SOURCE_KINDS, tokenize
 from synthetic_research.s3_log import log_question
 from synthetic_research.search import retrieve_evidence
-from synthetic_research.synthesis import blank_synthesis, cited_ids, plan_synthesis, public_synthesis
+from synthetic_research.synthesis import (
+    answer_evidence_ids,
+    blank_synthesis,
+    plan_synthesis,
+    public_synthesis,
+)
 
 TURN_CAP = 50
 
@@ -876,6 +882,7 @@ class ResearchEngine:
                             interview["cohortId"],
                             session_id=session["sessionId"],
                             query_vector=query_vector,
+                            search_context=_search_role(session),
                         )
                         or []
                     )
@@ -945,6 +952,7 @@ class ResearchEngine:
             )
         )
         allowed = {item["id"] for item in model_evidence if item.get("id")}
+        citable_ids = {str(item["id"]) for item in evidence if item.get("id")}
         evidence_ids = [item for item in raw.get("evidenceIds") or [] if item in allowed]
         reply = str(raw.get("reply") or "").strip()
         reply, evidence_ids, removed = lock_citations(reply, evidence_ids, allowed)
@@ -963,7 +971,8 @@ class ResearchEngine:
                 source=None,
                 synthesis=blank_synthesis("none"),
             )
-        evidence_ids = [item for item in cited_ids(plan, evidence_ids) if item in allowed]
+        model_citations = list(evidence_ids)
+        evidence_ids = answer_evidence_ids(plan, model_citations, citable_ids) or model_citations
         prior_document_ids: set[str] = set()
         for prior_turn in interview.get("turns") or []:
             for document_id in prior_turn.get("evidenceIds") or []:
@@ -983,11 +992,29 @@ class ResearchEngine:
             model_evidence,
             question=question,
             corpus_evidence=corpus_for_restore,
-            allowed=allowed,
+            allowed=citable_ids,
             retrieval_ids=retrieval_ids,
             prior_document_ids=prior_document_ids,
         )
         evidence_ids = [item for item in evidence_ids if item in retrieval_ids]
+        reply = restrain_future_as_current(question, reply, corpus_for_restore)
+        if reply and not evidence_ids:
+            fallback = [item for item in model_citations if item in retrieval_ids]
+            if fallback:
+                evidence_ids = fallback
+            else:
+                return _finish_turn(
+                    interview,
+                    question,
+                    abstain=True,
+                    reason="uncited",
+                    reply="",
+                    evidence_ids=[],
+                    evidence=evidence,
+                    mcp_results=mcp_results,
+                    source=None,
+                    synthesis=blank_synthesis("none"),
+                )
         leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
         pii = find_pii([{"id": "reply", "title": "", "text": reply}])
         if leaked or pii:
@@ -1009,7 +1036,13 @@ class ResearchEngine:
         )
         if removed:
             used_web = any(str(item).startswith("WEB-") for item in evidence_ids)
-            turn["confidence"] = grounding_confidence(supported=True, removed=removed, used_web=used_web)
+            transcript_cited = any(not str(item).startswith("WEB-") for item in evidence_ids)
+            turn["confidence"] = grounding_confidence(
+                supported=True,
+                removed=removed,
+                used_web=used_web,
+                transcript_cited=transcript_cited,
+            )
             turn["grounding"] = {"supported": True, "removed": removed}
         if plan.get("mode") in {"direct", "conflict"}:
             _note_direct_basis(turn, plan)
@@ -1324,14 +1357,34 @@ def _public_mcp(item: dict) -> dict:
 def _confidence(evidence: list[dict], evidence_ids: list[str], source: str | None) -> dict:
     if source == "system":
         return {"score": 0.35, "label": "low", "basis": "system dataset"}
-    cited = [item for item in evidence if item.get("id") in evidence_ids]
+    cited = [item for item in evidence if item.get("id") in set(evidence_ids)]
     if not cited:
         return {"score": 0.0, "label": "none", "basis": "uncited"}
-    databases = sorted({item.get("database") for item in cited if item.get("database")})
+    transcripts = [
+        item
+        for item in cited
+        if not str(item.get("id") or "").startswith("WEB-") and item.get("database") != "web"
+    ]
+    if not transcripts:
+        return {
+            "score": 0.35,
+            "label": "low",
+            "basis": "public web page, not this respondent's own record",
+        }
+    databases = sorted({item.get("database") for item in transcripts if item.get("database")})
     basis = "cited score"
     if databases:
         basis = "cited score from " + ", ".join(databases)
     return {"score": 1.0, "label": "high", "basis": basis}
+
+
+def _search_role(session: dict) -> str:
+    """The respondent's role for a public search, not the full persona instructions."""
+    persona = _session_persona(session)
+    if not persona:
+        return ""
+    sentence = re.split(r"(?<=[.!?])\s+", persona, maxsplit=1)[0]
+    return " ".join(sentence.split())[:160]
 
 
 _WEB_WALL = (
@@ -1376,7 +1429,7 @@ def _external_evidence(session: dict, results: list[dict]) -> list[dict]:
                 "title": result.get("url") or result.get("tool") or database,
                 "text": text,
                 "cohortIds": [],
-                "score": 1.0,
+                "score": 0.05,
                 "database": database,
                 "url": result.get("url") or "",
             }

@@ -249,6 +249,30 @@ def plan_synthesis(
     )
 
 
+def answer_evidence_ids(plan: dict, model_citations: list[str], citable_ids: set[str]) -> list[str]:
+    """Citations the reply may show.
+
+    The model's own documents stay. A direct answer and each side of a conflict
+    are added. Indirect matches that the reply did not use are not swapped in.
+    """
+    ordered: list[str] = []
+
+    def add(document_id: str | None) -> None:
+        if document_id and document_id in citable_ids and document_id not in ordered:
+            ordered.append(str(document_id))
+
+    if plan.get("mode") != "indirect":
+        add(plan.get("directDocumentId"))
+    for conflict in plan.get("conflicts") or []:
+        for side in conflict.get("sides") or []:
+            add(side.get("excerptDocumentId"))
+            for document_id in side.get("documentIds") or []:
+                add(document_id)
+    for document_id in model_citations:
+        add(document_id)
+    return ordered
+
+
 def cited_ids(plan: dict, extra: list[str] | None = None) -> list[str]:
     """The documents that state or conflict on the answer, most direct first.
 

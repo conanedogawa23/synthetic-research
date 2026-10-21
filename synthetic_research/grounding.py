@@ -102,13 +102,25 @@ def _tidy_citation_text(text: str) -> str:
     return cleaned.strip()
 
 
-def grounding_confidence(*, supported: bool, removed: list[str], used_web: bool) -> dict:
-    """Confidence is 1 only when the reply survived the citation check unchanged."""
+def grounding_confidence(
+    *,
+    supported: bool,
+    removed: list[str],
+    used_web: bool,
+    transcript_cited: bool = True,
+) -> dict:
+    """Confidence is 1 only when the reply survived the citation check unchanged.
+
+    A public web page never raises that score. On its own it stays low.
+    """
+    if used_web and not transcript_cited:
+        return {
+            "score": 0.35,
+            "label": "low",
+            "basis": "public web page, not this respondent's own record",
+        }
     if supported and not removed:
-        basis = "supported by the cited transcripts"
-        if used_web:
-            basis = "supported by the cited documents"
-        return {"score": 1.0, "label": "high", "basis": basis}
+        return {"score": 1.0, "label": "high", "basis": "supported by the cited transcripts"}
     reason = "citations were corrected to the supplied documents"
     if not supported:
         reason = "the reply was rewritten to what the documents support"

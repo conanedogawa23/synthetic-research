@@ -12,6 +12,11 @@ if [[ ! -x "$python" ]]; then
   exit 1
 fi
 
+if ! command -v uvx >/dev/null 2>&1 && [[ ! -x "${HOME}/.local/bin/uvx" ]]; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+fi
+export PATH="${HOME}/.local/bin:${PATH}"
+
 PYTHONPATH="$root" "$python" -m unittest discover -s "$root/tests" -v
 rsync -a --delete \
   --exclude .env \

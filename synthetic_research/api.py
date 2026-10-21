@@ -655,7 +655,12 @@ def _reply(turn: dict, kinds: dict[str, str], document_ids: list[str]) -> dict:
         seen.add(evidence_id)
         kind = kinds.get(evidence_id, "transcript")
         chips.append({"spanId": evidence_id, "kind": kind if kind in EVIDENCE_KINDS else "transcript"})
-    if not chips or not str(turn.get("reply") or "").strip():
+    reply_text = str(turn.get("reply") or "").strip()
+    if not chips or not reply_text:
+        if reply_text and not turn.get("abstain"):
+            basis = str((turn.get("confidence") or {}).get("basis") or "")
+            if basis == "uncited" or not list(turn.get("evidenceIds") or []):
+                return {"kind": "uncited", "text": turn["reply"], "reason": "uncited"}
         return {"kind": "abstain", "reason": turn.get("abstainReason") or "uncited"}
     return {"kind": "cited", "text": turn["reply"], "chips": chips}
 

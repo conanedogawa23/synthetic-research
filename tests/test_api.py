@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from synthetic_research.api import ResearchApi, load_packs
+from synthetic_research.api import ResearchApi, _reply, load_packs
 from synthetic_research.engine import ResearchEngine
 from synthetic_research.store import SessionStore
 
@@ -209,6 +209,18 @@ class ResearchApiTests(unittest.TestCase):
         session = self.api.engine.store.read(opened["data"]["id"])
         self.assertEqual(session["kit"]["persona"], persona)
         self.assertEqual(session["kit"]["purpose"], purpose_before)
+
+
+    def test_uncited_turn_shows_reply_instead_of_declined(self):
+        turn = {
+            "abstain": False,
+            "reply": "The field teams lose time when data never reaches them.",
+            "evidenceIds": [],
+            "confidence": {"score": 0.0, "label": "none", "basis": "uncited"},
+        }
+        shaped = _reply(turn, {}, [])
+        self.assertEqual(shaped["kind"], "uncited")
+        self.assertIn("field teams", shaped["text"])
 
 
 if __name__ == "__main__":

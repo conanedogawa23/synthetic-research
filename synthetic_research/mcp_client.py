@@ -23,6 +23,15 @@ class McpServer:
     env: dict[str, str]
 
 
+def _search_query(question: str, search_context: str | None) -> str:
+    """Public search uses the respondent's role plus the question, capped for the tool."""
+    role = " ".join(str(search_context or "").split())
+    asked = " ".join(str(question or "").split())
+    if role and role.lower() not in asked.lower():
+        asked = f"{role} {asked}".strip()
+    return asked[:400]
+
+
 def _enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
 
@@ -80,11 +89,12 @@ class ResearchMcp:
         cohort_id: str,
         session_id: str | None = None,
         query_vector: list[float] | None = None,
+        search_context: str | None = None,
     ) -> list[dict]:
         del cohort_id
         results = []
         if _enabled("MCP_WEB"):
-            results.extend(self._web(question))
+            results.extend(self._web(_search_query(question, search_context)))
         else:
             results.append(_skipped("web", "search", "MCP_WEB is off."))
         if _enabled("MCP_VECTOR"):
@@ -144,12 +154,29 @@ class ResearchMcp:
         key = os.environ.get("BRAVE_API_KEY", "").strip()
         if key:
             return self._brave(question)
+        if _uvx_command() is None:
+            return [
+                _skipped(
+                    "web",
+                    "search",
+                    "uvx is not installed; install uv (https://docs.astral.sh/uv/) or set BRAVE_API_KEY.",
+                )
+            ]
         return self._duckduckgo(question)
 
     def _duckduckgo(self, question: str) -> list[dict]:
+        server = _duckduckgo_server()
+        if server is None:
+            return [
+                _skipped(
+                    "web",
+                    "search",
+                    "uvx is not installed; install uv (https://docs.astral.sh/uv/) or set BRAVE_API_KEY.",
+                )
+            ]
         try:
             raw = self.call_tool(
-                _duckduckgo_server(),
+                server,
                 "search",
                 {
                     "query": question[:400],
@@ -166,9 +193,16 @@ class ResearchMcp:
         return results
 
     def _duckduckgo_fetch(self, url: str) -> dict:
+        server = _duckduckgo_server()
+        if server is None:
+            return _skipped(
+                "web",
+                "fetch_content",
+                "uvx is not installed; install uv (https://docs.astral.sh/uv/) or set BRAVE_API_KEY.",
+            )
         try:
             page = self.call_tool(
-                _duckduckgo_server(),
+                server,
                 "fetch_content",
                 {"url": url, "max_length": 2000},
             )
@@ -196,8 +230,15 @@ class ResearchMcp:
         return results
 
     def _fetch(self, url: str) -> dict:
+        server = _fetch_server()
+        if server is None:
+            return _skipped(
+                "web",
+                "fetch",
+                "uvx is not installed; install uv (https://docs.astral.sh/uv/) or set BRAVE_API_KEY.",
+            )
         try:
-            page = self.call_tool(_fetch_server(), "fetch", {"url": url, "max_length": 2000})
+            page = self.call_tool(server, "fetch", {"url": url, "max_length": 2000})
         except Exception as error:
             return _failed("web", "fetch", "fetch", error)
         return _ok("web", "fetch", "fetch", page, url)
@@ -242,22 +283,33 @@ class ResearchMcp:
             text = self.call_tool(_knowledge_server(), tool, arguments)
         except Exception as error:
             return _failed(database, "session-knowledge", tool, error)
+        if database == "graph" and tool == "graph_query" and not str(text or "").strip():
+            return _skipped("graph", "graph_query", "No graph stored or no edge matches this question.")
         return _ok(database, "session-knowledge", tool, text)
 
     def call_tool(self, server: McpServer, tool: str, arguments: dict) -> str:
         return asyncio.run(_call_tool(server, tool, arguments))
 
 
-def _uvx() -> str:
+def _uvx_command() -> str | None:
     import shutil
 
-    return shutil.which("uvx") or "/opt/homebrew/bin/uvx"
+    found = shutil.which("uvx")
+    if found:
+        return found
+    local = Path.home() / ".local" / "bin" / "uvx"
+    if local.is_file():
+        return str(local)
+    return None
 
 
-def _duckduckgo_server() -> McpServer:
+def _duckduckgo_server() -> McpServer | None:
+    command = _uvx_command()
+    if not command:
+        return None
     return McpServer(
         "duckduckgo",
-        _uvx(),
+        command,
         ("--with", "duckduckgo-mcp-server[browser]", "duckduckgo-mcp-server"),
         {
             "DDG_SAFE_SEARCH": os.environ.get("DDG_SAFE_SEARCH", "MODERATE"),
@@ -266,8 +318,11 @@ def _duckduckgo_server() -> McpServer:
     )
 
 
-def _fetch_server() -> McpServer:
-    return McpServer("fetch", _uvx(), ("mcp-server-fetch",), {})
+def _fetch_server() -> McpServer | None:
+    command = _uvx_command()
+    if not command:
+        return None
+    return McpServer("fetch", command, ("mcp-server-fetch",), {})
 
 
 def _brave_server(key: str) -> McpServer:
