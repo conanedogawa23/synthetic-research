@@ -499,7 +499,7 @@ def _interview(session: dict, interview: dict) -> dict:
         "status": "ended" if interview.get("status") == "ended" else "open",
         "phase": interview.get("phase") or "rapport",
         "turnsUsed": interview.get("turnsUsed") or 0,
-        "turnCap": interview.get("turnCap") or TURN_CAP,
+        "turnCap": max(int(interview.get("turnCap") or 0), TURN_CAP),
         "turns": _turns(session, interview),
     }
 

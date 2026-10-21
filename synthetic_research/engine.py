@@ -23,7 +23,7 @@ from synthetic_research.s3_log import log_question
 from synthetic_research.search import retrieve_evidence
 from synthetic_research.synthesis import blank_synthesis, cited_ids, plan_synthesis, public_synthesis
 
-TURN_CAP = 24
+TURN_CAP = 50
 
 
 def should_follow_up(turn: dict, turns_left: int) -> bool:
@@ -456,6 +456,8 @@ class ResearchEngine:
     def ask(self, session_id: str, cohort_id: str, question: str) -> dict:
         session = self._insight_session(session_id)
         interview = _open_interview(session, cohort_id)
+        if int(interview.get("turnCap") or 0) < TURN_CAP:
+            interview["turnCap"] = TURN_CAP
         if interview["turnsUsed"] >= interview["turnCap"]:
             raise ResearchError("TURN_CAP", f"The {TURN_CAP}-turn cap is reached.")
         assert_brand_allowed(interview["phase"], question, session["kit"]["brandAlias"])
