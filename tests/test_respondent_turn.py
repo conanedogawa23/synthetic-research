@@ -259,6 +259,7 @@ class RespondentTurnTests(unittest.TestCase):
                     ),
                 }
             ],
+            question="Where does filter coffee fit in that morning?",
         )
         self.assertIn("before I sit down", reply)
         self.assertIn("22110 cups", reply)
@@ -304,6 +305,28 @@ class RespondentTurnTests(unittest.TestCase):
         self.assertIn("morning drink is mine", reply)
         self.assertNotIn("out of scope", reply)
         self.assertNotIn("Metro office drinkers", reply)
+
+    def test_a_long_earnings_file_does_not_paste_whole(self):
+        earnings = (
+            "Evergreen Consumer Products plc FY2025 Earnings Release — Synthetic Case Material\n"
+            "For classroom use only.\n"
+            "FY2025: Growth despite a challenging environment\n"
+            "Evergreen Consumer Products plc reported net sales of €9.2 billion, an increase of 4.8% year on year.\n"
+            "The workforce grew to 12,050 field personnel across more than 30 markets.\n"
+            "Selling and commercial expenses rose to €1.49 billion."
+        )
+        reply = restore_cited_specifics(
+            "The focus is profitable growth and commercial productivity in the market.",
+            ["ST-01"],
+            [{"id": "ST-01", "kind": "transcript", "text": earnings}],
+            question="What are the biggest priorities for your sales organization over the next 12–24 months?",
+        )
+        self.assertIn("profitable growth", reply)
+        self.assertNotIn("classroom use only", reply)
+        self.assertNotIn("Synthetic Case Material", reply)
+        self.assertNotIn("12,050 field personnel", reply)
+        self.assertNotIn("€1.49 billion", reply)
+        self.assertLessEqual(len(reply.split()), 80)
 
 
 if __name__ == "__main__":

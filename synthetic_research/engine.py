@@ -964,7 +964,7 @@ class ResearchEngine:
                 synthesis=blank_synthesis("none"),
             )
         evidence_ids = [item for item in cited_ids(plan, evidence_ids) if item in allowed]
-        reply = restore_cited_specifics(reply, evidence_ids, model_evidence)
+        reply = restore_cited_specifics(reply, evidence_ids, model_evidence, question=question)
         leaked = mentions_brand(reply, session["kit"]["brandAlias"]) and interview["phase"] != "prompted"
         pii = find_pii([{"id": "reply", "title": "", "text": reply}])
         if leaked or pii:

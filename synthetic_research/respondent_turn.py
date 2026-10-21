@@ -22,6 +22,10 @@ _NUMBER_WORDS = re.compile(
     re.IGNORECASE,
 )
 _UNIT = re.compile(r"\b(?:rupees?|cups?|months?|days?|weeks?|percent|pack)\b", re.IGNORECASE)
+_MONEY = re.compile(r"\b(?:€|euros?|billion|million|rupees?)\b", re.IGNORECASE)
+_PERCENT = re.compile(r"\d[\d,]*(?:\.\d+)?%")
+_CASE_MATERIAL = re.compile(r"classroom use only|synthetic case", re.IGNORECASE)
+_YEAR_KEY = re.compile(r"^\d{4}$")
 _SCREENER = re.compile(
     r"out of scope|hard out|member count|gold slice|tea-only|do not interview|"
     r"metro office drinkers|ready-to-drink coffee in the last|incidence is higher",
@@ -29,6 +33,9 @@ _SCREENER = re.compile(
 )
 
 THIN_WORD_LIMIT = 45
+SHORT_SPAN_WORDS = 60
+LONG_SPAN_CHARS = 350
+FIGURE_RESTORE_LIMIT = 3
 
 CHAT_TURN_LIMIT = 2
 LEDGER_LIMIT = 12
@@ -191,8 +198,25 @@ def enforce_required_statements(
     return text, kept
 
 
+def _clauses(text: str) -> list[str]:
+    """Sentences and standalone lines from a document span."""
+    clauses: list[str] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = _SENTENCE_SPLIT.split(line) if re.search(r"[.!?]", line) else [line]
+        for part in parts:
+            piece = part.strip()
+            if piece:
+                clauses.append(piece)
+    if not clauses and (text or "").strip():
+        return [(text or "").strip()]
+    return clauses
+
+
 def _sentences(text: str) -> list[str]:
-    return [part.strip() for part in _SENTENCE_SPLIT.split((text or "").strip()) if part.strip()]
+    return _clauses(text)
 
 
 def _normalize(text: str) -> str:
@@ -215,6 +239,52 @@ def _figure_keys(text: str) -> set[str]:
     return keys
 
 
+def _restorable_figure_keys(text: str) -> set[str]:
+    """Figures worth restoring. A four-digit year alone is not enough."""
+    keys: set[str] = set()
+    for key in _figure_keys(text):
+        if _YEAR_KEY.match(key.replace(",", "")):
+            continue
+        keys.add(key)
+    return keys
+
+
+def _qualifying_figure_gap(sentence: str, present: set[str]) -> set[str]:
+    """Missing count, money, or percent figures from a sentence."""
+    missing = _restorable_figure_keys(sentence) - present
+    if not missing:
+        return set()
+    if _MONEY.search(sentence) or _PERCENT.search(sentence) or _UNIT.search(sentence):
+        return missing
+    for key in missing:
+        digits = key.replace(".", "").replace(",", "")
+        if digits.isdigit() and len(digits) >= 3:
+            return missing
+    return set()
+
+
+def _question_overlap(question: str, sentence: str) -> int:
+    """Shared content words between the question and a candidate sentence."""
+    question_tokens = {token for token in tokenize(question) if len(token) > 2 and not token.isdigit()}
+    if not question_tokens:
+        return 0
+    sentence_tokens = {token for token in tokenize(sentence) if len(token) > 2 and not token.isdigit()}
+    return len(question_tokens & sentence_tokens)
+
+
+def _is_case_material(sentence: str) -> bool:
+    return bool(_CASE_MATERIAL.search(sentence))
+
+
+def _span_word_count(text: str) -> int:
+    return len(str(text or "").split())
+
+
+def _is_long_span(text: str) -> bool:
+    body = str(text or "")
+    return len(body) > LONG_SPAN_CHARS or _span_word_count(body) > SHORT_SPAN_WORDS
+
+
 def _covered(reply_norm: str, sentence: str) -> bool:
     norm = _normalize(sentence)
     if norm and norm in reply_norm:
@@ -227,8 +297,14 @@ def _covered(reply_norm: str, sentence: str) -> bool:
     return hits / len(tokens) >= 0.75
 
 
-def restore_cited_specifics(reply: str, evidence_ids: list[str], evidence: list[dict]) -> str:
-    """Keep the model's answer. Put back cited prices, counts, and a thin span's other sentences."""
+def restore_cited_specifics(
+    reply: str,
+    evidence_ids: list[str],
+    evidence: list[dict],
+    *,
+    question: str = "",
+) -> str:
+    """Keep the model's answer. Restore missing figures the question calls for, not whole files."""
     by_id: dict[str, dict] = {}
     for item in evidence:
         document_id = str(item.get("id") or "")
@@ -237,46 +313,61 @@ def restore_cited_specifics(reply: str, evidence_ids: list[str], evidence: list[
     cited_text = " ".join(str(by_id.get(document_id, {}).get("text") or "") for document_id in evidence_ids)
     cited_norm = _normalize(cited_text)
     kept: list[str] = []
-    for sentence in _sentences(reply):
+    for sentence in _clauses(reply):
         if _SCREENER.search(sentence) and _normalize(sentence) not in cited_norm:
+            continue
+        if _is_case_material(sentence) and _normalize(sentence) not in cited_norm:
             continue
         kept.append(sentence)
     text = " ".join(kept).strip()
     reply_norm = _normalize(text)
     present = _figure_keys(text)
-    additions: list[str] = []
 
-    def add(sentence: str) -> None:
-        nonlocal reply_norm, present
+    figure_candidates: list[tuple[int, str]] = []
+    for document_id in evidence_ids:
+        item = by_id.get(document_id) or {}
+        if str(item.get("kind") or "") == "screener":
+            continue
+        body = str(item.get("text") or "")
+        for sentence in _clauses(body):
+            if _SCREENER.search(sentence) or _is_case_material(sentence):
+                continue
+            if _normalize(sentence) in reply_norm:
+                continue
+            if not _qualifying_figure_gap(sentence, present):
+                continue
+            overlap = _question_overlap(question, sentence)
+            if overlap < 1:
+                continue
+            figure_candidates.append((overlap, sentence))
+    figure_candidates.sort(key=lambda row: (-row[0], row[1]))
+    for _overlap, sentence in figure_candidates[:FIGURE_RESTORE_LIMIT]:
         norm = _normalize(sentence)
         if not norm or norm in reply_norm:
-            return
-        additions.append(sentence)
+            continue
+        text = f"{text} {sentence}".strip()
         reply_norm = f"{reply_norm} {norm}".strip()
         present |= _figure_keys(sentence)
 
-    for document_id in evidence_ids:
-        item = by_id.get(document_id) or {}
-        if str(item.get("kind") or "") == "screener":
-            continue
-        for sentence in _sentences(str(item.get("text") or "")):
-            if _SCREENER.search(sentence):
-                continue
-            missing = _figure_keys(sentence) - present
-            if missing:
-                add(sentence)
-    text = " ".join([text, *additions]).strip()
-    if len(text.split()) >= THIN_WORD_LIMIT:
+    if _span_word_count(text) >= THIN_WORD_LIMIT:
         return " ".join(text.split())
+
     for document_id in evidence_ids:
         item = by_id.get(document_id) or {}
         if str(item.get("kind") or "") == "screener":
             continue
-        for sentence in _sentences(str(item.get("text") or "")):
-            if _SCREENER.search(sentence) or _covered(reply_norm, sentence):
+        body = str(item.get("text") or "")
+        if _is_long_span(body):
+            continue
+        for sentence in _clauses(body):
+            if _SCREENER.search(sentence) or _is_case_material(sentence) or _covered(reply_norm, sentence):
                 continue
-            add(sentence)
-            text = " ".join([text, sentence]).strip()
-            if len(text.split()) >= THIN_WORD_LIMIT:
+            norm = _normalize(sentence)
+            if not norm or norm in reply_norm:
+                continue
+            text = f"{text} {sentence}".strip()
+            reply_norm = f"{reply_norm} {norm}".strip()
+            present |= _figure_keys(sentence)
+            if _span_word_count(text) >= THIN_WORD_LIMIT:
                 return " ".join(text.split())
     return " ".join(text.split())
